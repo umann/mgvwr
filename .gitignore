@@ -1,0 +1,40 @@
+# Build directories
+build/
+build_windows/
+cmake-build-*/
+
+# CMake generated files
+CMakeCache.txt
+cmake_install.cmake
+CMakeFiles/
+compile_commands.json
+_deps/
+*.ninja
+.ninja*
+
+# Compiled binaries and objects
+*.exe
+*.dll
+*.so
+*.a
+*.o
+*.obj
+
+# IDE files
+.vscode/
+.vs/
+.idea/
+*.user
+*.suo
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Cache and temp
+osm_cache/
+*.log
+*.tmp
+
+# Playground
+playground/

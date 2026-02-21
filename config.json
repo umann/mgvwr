@@ -1,0 +1,17 @@
+{
+  "watched_folders": [
+    "F:\\photos",
+    "D:\\photos",
+    "F:\\scan\\split",
+    "D:\\scan\\split"
+  ],
+  "font": {
+    "size": 22,
+    "candidates": [
+        "C:\\Windows\\Fonts\\segoeui.ttf",
+        "C:\\Windows\\Fonts\\arial.ttf",
+        "C:\\Windows\\Fonts\\tahoma.ttf"
+    ]    
+  },
+  "single_instance_mode": true
+}

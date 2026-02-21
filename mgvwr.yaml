@@ -1,0 +1,118 @@
+home_country: Magyarország
+geo_keyword_prefix: "@"
+regions:
+  - Adria
+  - Autostrada dei Fiori
+  - Bakony
+  - Balaton
+  - Boden-tó
+  - Bodrog
+  - Budai-hegység
+  - Börzsöny hegység
+  - Bükk
+  - Capri
+  - Csepel-sziget
+  - Cserhát hegység
+  - Dráva
+  - Duna
+  - Dömörkapu
+  - Elba
+  - Erdély
+  - Ferihegy
+  - Fertő tó
+  - Finger Lakes
+  - Garam
+  - Gemenc
+  - Grossglockner Hochalpenstrasse
+  - Gyadai-rét
+  - Inn
+  - Ipoly
+  - Isle of Wight
+  - Isonzó
+  - Isztria
+  - Kis-Balaton
+  - La Manche
+  - Lago di Como
+  - Lago di Garda
+  - Lahn
+  - Lomnic
+  - Long Island
+  - Lupa Beach
+  - Lupa
+  - Magas-Tátra
+  - Majna
+  - Monte Piana
+  - Mosoni-Duna
+  - Mátra
+  - Nagy-Havasalföld
+  - Naszály-hegy
+  - Nílus
+  - Pilis hegység
+  - Plitvicei-tavak
+  - Pó-delta
+  - Rab-sziget
+  - Rajna
+  - Rába
+  - Ráckevei-Duna
+  - Sió
+  - Sorrentói-félsziget
+  - Szajna
+  - Szamos
+  - Szentendrei-Duna
+  - Szentendrei-sziget
+  - Szigetköz
+  - Szurdok
+  - Temze
+  - Tevere
+  - Texel
+  - Tirrén-tenger
+  - Tisza-tó
+  - Tisza
+  - Tre Cime di Lavaredo
+  - Velencei-tó
+  - Visztula
+  - Vág folyó
+  - Wachau
+  - Wörthi-tó
+  - Zala folyó
+  - Zemplén
+font:
+  size: 0.625%
+single_instance_mode: true
+path_classifications:
+  - pattern: '/(\d{4})/(\d{2})/(\d{2})(?:/|$)'
+    names: ["year", "month", "day"]
+  - pattern: '/split/(\w+)/(\d{5})/(\w+)(?:/|$)'
+    names: ["owner", "year", "film roll"]
+image_file:
+  supported_suffixes: [".jpg", ".jpeg", ".png", ".bmp", ".gif", ".tiff"]
+watched_folders:
+  - "C:\\photos"
+  - "D:\\photos"
+  - "F:\\photos"
+  - "I:\\photos"
+  - "C:\\scan\\split"
+  - "D:\\scan\\split"
+  - "F:\\scan\\split"
+  - "I:\\scan\\split"
+window_mode:
+  is_default: false
+  default_size: ["80%", "80%"]
+quiet_mode: false
+filters:
+  - expression: "Keywords % 'NOMINUS'"
+    key: n
+map:
+  cache:
+    max_size_mb: 5000
+  viewer:
+    window:
+      size: [25%, 33.333333%]
+  links:
+    - name: OpenStreetMap
+      enabled: false
+      zoom: 15
+      gui_url_template: "https://www.openstreetmap.org/?mlat={{GPSLatitude}}&mlon={{GPSLongitude}}#map={{zoom}}/{{GPSLatitude}}/{{GPSLongitude}}"
+    - name: Google Maps
+      zoom: 17
+      gui_url_template: "https://www.google.com/maps/place/{{GPSLatitude}},{{GPSLongitude}}/@{{GPSLatitude}},{{GPSLongitude}},{{zoom}}z"
