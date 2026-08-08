@@ -14,9 +14,14 @@ PageUp            Prev folder
 Home              First image in folder  
 End               Last image in folder  
 .                 Toggle Map  
-Enter             Toggle Fullscreen  
+Ctrl c            Copy selection if any, else copy image full path  
+Ctrl +            Zoom Map In
+Ctrl -            Zoom Map Out
+0                 Reset Map Zoom to Default  
+Enter             Toggle Fullscreen
+F1                Toggle Help
 MouseWheel        Next/Prev  
-Ctrl+MouseWheel   Zoom Map  
+Ctrl MouseWheel   Zoom Map  
 {% for filter in config.filters %}{{ filter.key }}                 Toggle Filter: {{ filter.expression }}  
 {% endfor %})";
 
@@ -29,18 +34,22 @@ static constexpr const char *UNUSED_HTML_INJA_TEMPLATE_BUT_DO_NOT_DELETE_IT = R"
 <body>
 <p>Keys</p>
 <table>
+    <tr><td>Esc</td><td>Close Help / App</td></tr>
     <tr><td>Right</td><td>Next image in folder</td></tr>
     <tr><td>Left</td><td>Previous image in folder</td></tr>
     <tr><td>PageDown</td><td>Next folder</td></tr>
     <tr><td>PageUp</td><td>Previous folder</td></tr>
-    <tr><td>Home</td><td>Go to first image in folder</td></tr>
-    <tr><td>End</td><td>Go to last image in folder</td></tr>
+    <tr><td>Home</td><td>First image in folder</td></tr>
+    <tr><td>End</td><td>Last image in folder</td></tr>
     <tr><td>.</td><td>Toggle Map</td></tr>
+    <tr><td>Ctrl c</td><td>Copy selection if any<br>else copy image full path</td></tr>
+    <tr><td>Ctrl +</td><td>Zoom Map In</td></tr>
+    <tr><td>Ctrl -</td><td>Zoom Map Out</td></tr>
+    <tr><td>0</td><td>Zoom Map to Default</td></tr>
     <tr><td>Enter</td><td>Toggle Fullscreen</td></tr>
     <tr><td>F1</td><td>Toggle Help</td></tr>
-    <tr><td>Esc</td><td>Close Help / App</td></tr>
     <tr><td>MouseWheel</td><td>Next/Prev</td></tr>
-    <tr><td>Ctrl+MouseWheel</td><td>Zoom Map</td></tr>{% for filter in config.filters %}
+    <tr><td>Ctrl MouseWheel</td><td>Zoom Map</td></tr>{% for filter in config.filters %}
     <tr><td>{{ filter.key }}</td><td>Toggle Filter: {{ filter.expression }}</td></tr>
 {% endfor %}
 </table>
@@ -150,4 +159,21 @@ void drawHelp(std::shared_ptr<sf::RenderWindow> window, const std::vector<std::s
         text.setPosition({textX, yPos});
         window->draw(text);
     }
+}
+
+void usage(const std::string &programName, const std::string &message) {
+    if (!message.empty()) {
+        log_stderr(message);
+        log_stderr("");
+    }
+
+    log_stderr("Usage: ", programName, " <image_file>");
+    log_stderr("   or: ", programName, " --config <file> <image_file>");
+    log_stderr("   or: ", programName, " --self-check [--config <file>]");
+    log_stderr("   or: ", programName, " --cache-osm [--config <file>] [--zoom <level>] <path> [<path> ...]");
+    log_stderr("   or: ", programName, " --exiftool <image_file>");
+    log_stderr("   or: ", programName, " --poor <image_file>");
+    log_stderr("   or: ", programName, " [--config <file>] [--zoom <level>] <image_file>");
+    log_stderr("");
+    log_stderr("Supported formats: JPG, PNG, BMP, GIF, TIFF");
 }

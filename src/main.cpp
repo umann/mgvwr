@@ -31,10 +31,10 @@
 #include <yaml-cpp/yaml.h>
 
 #ifdef _WIN32
-#include <windows.h>
 #include <regex>
 #include <shellapi.h>
 #include <tlhelp32.h>
+#include <windows.h>
 #endif
 
 namespace fs = std::filesystem;
@@ -581,6 +581,8 @@ class MgVwr {
     bool sortByNameCurrentFolder = false;
     bool deferMetadataCurrentFolder = false;
     bool isHandCursorActive = false; // Track if hand cursor is currently set
+    float fitImageScale = 1.0f;
+    float currentImageScale = 1.0f;
 
     // Navigation arrow system
     enum class NavArrow { Left, Right, Up, Down };
@@ -591,8 +593,233 @@ class MgVwr {
     bool showHelp = false;
     std::vector<std::string> helpLines;
 
+    enum class ContextMenuAction {
+        None,
+        CopyImagePath,
+        CopyCoordinates,
+        ToggleMap,
+        OpenGoogleMaps,
+        ShowHelp,
+    };
+
+    struct ContextMenuItem {
+        std::string label;
+        bool enabled = true;
+        ContextMenuAction action = ContextMenuAction::None;
+        int mapIndex = -1;
+    };
+
+    bool contextMenuVisible = false;
+    sf::Vector2f contextMenuPos{0.f, 0.f};
+    std::vector<ContextMenuItem> contextMenuItems;
+
     std::vector<std::string> supportedSuffixes;
     std::vector<PathClassification> pathClassifications;
+
+    float getInlineMapY(unsigned int windowHeight, unsigned int mapHeight) const {
+        if (windowHeight <= mapHeight) {
+            return 0.0f;
+        }
+        return static_cast<float>(windowHeight - mapHeight);
+    }
+
+    float getBottomLeftOverlayY(float boxHeight, float margin = 15.0f) const {
+        float y = static_cast<float>(window->getSize().y) - boxHeight - margin;
+
+        if (experimental && mapViewer && mapViewer->isOpen()) {
+            const sf::Texture *mapTexture = mapViewer->getTexture();
+            if (mapTexture) {
+                float mapTopY = getInlineMapY(window->getSize().y, mapTexture->getSize().y);
+                y = std::min(y, mapTopY - boxHeight - margin);
+            }
+        }
+
+        return std::max(0.0f, y);
+    }
+
+    void copyImagePathToClipboard() {
+        if (!allImagePaths.empty()) {
+            std::string fullPath = toUtf8String(allImagePaths[currentIndex]);
+            sf::String clip = sf::String::fromUtf8(fullPath.begin(), fullPath.end());
+            sf::Clipboard::setString(clip);
+        }
+    }
+
+    void copyCurrentCoordinatesToClipboard() {
+        if (allImagePaths.empty()) {
+            return;
+        }
+
+        const auto &imagePath = allImagePaths[currentIndex];
+        if (!hasGpsLatitude(imagePath)) {
+            return;
+        }
+
+        double lat = getGpsValueOrZero(imagePath, "GPSLatitude");
+        double lon = getGpsValueOrZero(imagePath, "GPSLongitude");
+
+        std::ostringstream oss;
+        oss << std::fixed << std::setprecision(6) << lat << ", " << lon;
+        sf::String clip = sf::String::fromUtf8(oss.str().begin(), oss.str().end());
+        sf::Clipboard::setString(clip);
+    }
+
+    void toggleMapForCurrentImage() {
+        if (!mapViewer || allImagePaths.empty()) {
+            return;
+        }
+
+        const auto &imagePath = allImagePaths[currentIndex];
+        if (!hasGpsLatitude(imagePath)) {
+            return;
+        }
+
+        if (mapViewer->isOpen()) {
+            mapViewer->close();
+            return;
+        }
+
+        double lat = getGpsValueOrZero(imagePath, "GPSLatitude");
+        double lon = getGpsValueOrZero(imagePath, "GPSLongitude");
+        mapViewer->showMap(lat, lon, defaultZoom);
+    }
+
+    void openCurrentImageInGoogleMaps() {
+        if (allImagePaths.empty()) {
+            return;
+        }
+
+        const auto &imagePath = allImagePaths[currentIndex];
+        if (!hasGpsLatitude(imagePath)) {
+            return;
+        }
+
+        double lat = getGpsValueOrZero(imagePath, "GPSLatitude");
+        double lon = getGpsValueOrZero(imagePath, "GPSLongitude");
+        std::ostringstream oss;
+        oss << "https://www.google.com/maps?q=" << std::fixed << std::setprecision(6) << lat << "," << lon;
+        std::string url = oss.str();
+        openURL(url);
+    }
+
+    void openContextMenu(sf::Vector2f pos) {
+        bool hasGPS = !allImagePaths.empty() && hasGpsLatitude(allImagePaths[currentIndex]);
+        contextMenuItems.clear();
+        contextMenuItems.push_back({"Copy image full path", true, ContextMenuAction::CopyImagePath});
+        contextMenuItems.push_back({"Copy coordinates", hasGPS, ContextMenuAction::CopyCoordinates});
+
+        if (hasGPS && mapViewer) {
+            const char *toggleText = mapViewer->isOpen() ? "Hide map" : "Show on map";
+            contextMenuItems.push_back({toggleText, true, ContextMenuAction::ToggleMap});
+            contextMenuItems.push_back({"Open in Google Maps", true, ContextMenuAction::OpenGoogleMaps});
+        }
+
+        contextMenuItems.push_back({"Help", true, ContextMenuAction::ShowHelp});
+
+        contextMenuPos = pos;
+        contextMenuVisible = true;
+    }
+
+    void closeContextMenu() { contextMenuVisible = false; }
+
+    bool handleContextMenuClick(sf::Vector2f clickPos) {
+        if (!contextMenuVisible || contextMenuItems.empty() || !uiFontLoaded) {
+            return false;
+        }
+
+        const float paddingX = 12.f;
+        const float paddingY = 8.f;
+        const float itemHeight = static_cast<float>(getCalculatedFontSize() + 10);
+        const float menuWidth = 280.f;
+        const float menuHeight = paddingY * 2.f + itemHeight * static_cast<float>(contextMenuItems.size());
+
+        auto winSize = window->getSize();
+        float menuX = std::clamp(contextMenuPos.x, 0.f, static_cast<float>(winSize.x) - menuWidth - 2.f);
+        float menuY = std::clamp(contextMenuPos.y, 0.f, static_cast<float>(winSize.y) - menuHeight - 2.f);
+        sf::FloatRect menuRect(sf::Vector2f(menuX, menuY), sf::Vector2f(menuWidth, menuHeight));
+
+        if (!menuRect.contains(clickPos)) {
+            closeContextMenu();
+            return true;
+        }
+
+        float currentY = menuY + paddingY;
+        for (const auto &item : contextMenuItems) {
+            sf::FloatRect rect(sf::Vector2f(menuX, currentY), sf::Vector2f(menuWidth, itemHeight));
+            if (rect.contains(clickPos) && item.enabled) {
+                switch (item.action) {
+                case ContextMenuAction::CopyImagePath:
+                    copyImagePathToClipboard();
+                    break;
+                case ContextMenuAction::CopyCoordinates:
+                    copyCurrentCoordinatesToClipboard();
+                    break;
+                case ContextMenuAction::ToggleMap:
+                    toggleMapForCurrentImage();
+                    break;
+                case ContextMenuAction::OpenGoogleMaps:
+                    openCurrentImageInGoogleMaps();
+                    break;
+                case ContextMenuAction::ShowHelp:
+                    showHelp = true;
+                    break;
+                case ContextMenuAction::None:
+                    break;
+                }
+                closeContextMenu();
+                return true;
+            }
+            currentY += itemHeight;
+        }
+
+        closeContextMenu();
+        return true;
+    }
+
+    void drawContextMenu() {
+        if (!contextMenuVisible || contextMenuItems.empty() || !uiFontLoaded) {
+            return;
+        }
+
+        const float paddingX = 12.f;
+        const float paddingY = 8.f;
+        const float itemHeight = static_cast<float>(getCalculatedFontSize() + 10);
+        const float menuWidth = 280.f;
+        const float menuHeight = paddingY * 2.f + itemHeight * static_cast<float>(contextMenuItems.size());
+
+        auto winSize = window->getSize();
+        float menuX = std::clamp(contextMenuPos.x, 0.f, static_cast<float>(winSize.x) - menuWidth - 2.f);
+        float menuY = std::clamp(contextMenuPos.y, 0.f, static_cast<float>(winSize.y) - menuHeight - 2.f);
+
+        sf::RectangleShape bg(sf::Vector2f(menuWidth, menuHeight));
+        bg.setPosition({menuX, menuY});
+        bg.setFillColor(sf::Color(24, 24, 24, 240));
+        bg.setOutlineColor(sf::Color(180, 180, 180));
+        bg.setOutlineThickness(1.f);
+        window->draw(bg);
+
+        sf::Vector2f mousePos(static_cast<float>(sf::Mouse::getPosition(*window).x),
+                              static_cast<float>(sf::Mouse::getPosition(*window).y));
+        float currentY = menuY + paddingY;
+        for (const auto &item : contextMenuItems) {
+            sf::FloatRect rect(sf::Vector2f(menuX, currentY), sf::Vector2f(menuWidth, itemHeight));
+            bool hovered = rect.contains(mousePos);
+
+            if (hovered && item.enabled) {
+                sf::RectangleShape hoverBg(sf::Vector2f(menuWidth, itemHeight));
+                hoverBg.setPosition({menuX, currentY});
+                hoverBg.setFillColor(sf::Color(70, 70, 70));
+                window->draw(hoverBg);
+            }
+
+            sf::Text text(uiFont, item.label, getCalculatedFontSize());
+            text.setPosition({menuX + paddingX, currentY + 4.f});
+            text.setFillColor(item.enabled ? sf::Color::White : sf::Color(128, 128, 128));
+            window->draw(text);
+
+            currentY += itemHeight;
+        }
+    }
 
     void parseFilterExpression(Filter &filter) {
         // Extract pattern from expression like "Keywords % 'NOMINUS'"
@@ -1105,7 +1332,6 @@ class MgVwr {
         }
 
         float scale;
-        float posX, posY;
 
         if (experimental) {
             // Experimental layout: reserve map width pixels on LEFT, no right space
@@ -1116,40 +1342,113 @@ class MgVwr {
             float scaleX = availableWidth / textureWidth;
             float scaleY = windowHeight / textureHeight;
             scale = std::min(scaleX, scaleY);
-
-            sprite->setScale({scale, scale});
-
-            // Calculate scaled dimensions
-            float scaledWidth = textureWidth * scale;
-            float scaledHeight = textureHeight * scale;
-
-            // Try to center image horizontally in full window
-            posX = (windowWidth - scaledWidth) / 2.0f + scaledWidth / 2.0f;
-            posY = (windowHeight - scaledHeight) / 2.0f + scaledHeight / 2.0f;
-
-            // If image overlaps with map area (left side), move it right
-            float leftEdgeX = posX - scaledWidth / 2.0f;
-            if (leftEdgeX < mapReserved) {
-                float shiftNeeded = mapReserved - leftEdgeX;
-                posX += shiftNeeded;
-            }
-
-            sprite->setPosition({posX, posY});
+            fitImageScale = scale;
         } else {
             // Original layout: center image in full window
             float scaleX = windowWidth / textureWidth;
             float scaleY = windowHeight / textureHeight;
             scale = std::min(scaleX, scaleY);
-
-            sprite->setScale({scale, scale});
-
-            float scaledWidth = textureWidth * scale;
-            float scaledHeight = textureHeight * scale;
-            posX = (windowWidth - scaledWidth) / 2.0f + scaledWidth / 2.0f;
-            posY = (windowHeight - scaledHeight) / 2.0f + scaledHeight / 2.0f;
-
-            sprite->setPosition({posX, posY});
+            fitImageScale = scale;
         }
+
+        applyScaleWithCanonicalPosition(scale);
+    }
+
+    void applyScaleWithCanonicalPosition(float scale) {
+        if (!sprite || !texture) {
+            return;
+        }
+
+        auto windowSize = window->getSize();
+        float windowWidth = static_cast<float>(windowSize.x);
+        float windowHeight = static_cast<float>(windowSize.y);
+
+        auto textureSize = texture->getSize();
+        float textureWidth = static_cast<float>(textureSize.x);
+        float textureHeight = static_cast<float>(textureSize.y);
+
+        // Account for rotation when calculating display size.
+        float rotation = sprite->getRotation().asDegrees();
+        if ((rotation >= 45.0f && rotation <= 135.0f) || (rotation >= 225.0f && rotation <= 315.0f)) {
+            std::swap(textureWidth, textureHeight);
+        }
+
+        sprite->setScale({scale, scale});
+
+        float scaledWidth = textureWidth * scale;
+        float scaledHeight = textureHeight * scale;
+        float posX = (windowWidth - scaledWidth) / 2.0f + scaledWidth / 2.0f;
+        float posY = (windowHeight - scaledHeight) / 2.0f + scaledHeight / 2.0f;
+
+        if (experimental) {
+            float mapReserved = static_cast<float>(parseSizeValue(mapWindowWidth, windowSize.x));
+            float leftEdgeX = posX - scaledWidth / 2.0f;
+            if (leftEdgeX < mapReserved) {
+                posX += (mapReserved - leftEdgeX);
+            }
+        }
+
+        sprite->setPosition({posX, posY});
+        currentImageScale = scale;
+    }
+
+    bool zoomImageAtCursor(const sf::Vector2f &cursorPos, float wheelDelta) {
+        if (!sprite || !texture || wheelDelta == 0.0f) {
+            return false;
+        }
+
+        if (!sprite->getGlobalBounds().contains(cursorPos)) {
+            return false;
+        }
+
+        const float minScale = fitImageScale;
+        const float maxScale = std::max(minScale, 2.0f);
+        const float step = 1.10f;
+        const float oldScale = sprite->getScale().x;
+
+        float targetScale = oldScale;
+        if (wheelDelta > 0.0f) {
+            targetScale = oldScale * step;
+        } else if (wheelDelta < 0.0f) {
+            targetScale = oldScale / step;
+        }
+
+        targetScale = std::clamp(targetScale, minScale, maxScale);
+
+        // Consume wheel over image area even when already clamped at a limit.
+        if (targetScale == oldScale) {
+            jumpedToOldest = false;
+            if (wheelDelta > 0.0f && oldScale >= maxScale) {
+                navigationMessage = "Reached maximum zoom";
+            } else if (wheelDelta < 0.0f && oldScale <= minScale) {
+                navigationMessage = "Reached minimum zoom";
+            }
+            return true;
+        }
+
+        jumpedToOldest = false;
+        if (wheelDelta > 0.0f && targetScale >= maxScale) {
+            navigationMessage = "Reached maximum zoom";
+        } else if (wheelDelta < 0.0f && targetScale <= minScale) {
+            navigationMessage = "Reached minimum zoom";
+        } else {
+            navigationMessage.clear();
+        }
+
+        // Zoom-out should target canonical image placement, not cursor anchoring.
+        if (wheelDelta < 0.0f) {
+            applyScaleWithCanonicalPosition(targetScale);
+            return true;
+        }
+
+        // Keep the same image pixel under the cursor after scaling.
+        sf::Vector2f localPoint = sprite->getInverseTransform().transformPoint(cursorPos);
+        sprite->setScale({targetScale, targetScale});
+        sf::Vector2f after = sprite->getTransform().transformPoint(localPoint);
+        sprite->setPosition(sprite->getPosition() + (cursorPos - after));
+
+        currentImageScale = targetScale;
+        return true;
     }
 
     void ensureMetadataForImage(const fs::path &imagePath) {
@@ -1423,71 +1722,11 @@ class MgVwr {
         float windowWidth = static_cast<float>(windowSize.x);
         float windowHeight = static_cast<float>(windowSize.y);
 
-        float scale;
-        float posX, posY;
-
-        if (experimental) {
-            // Experimental layout: reserve map width pixels on LEFT, no right space
-            float mapReserved = static_cast<float>(parseSizeValue(mapWindowWidth, windowSize.x));
-            float availableWidth = windowWidth - mapReserved;
-
-            log_stdout("DEBUG Experimental Layout: windowWidth=", windowWidth, ", mapReserved=", mapReserved,
-                       ", availableWidth=", availableWidth);
-
-            if (availableWidth < 0) {
-                throw std::runtime_error(
-                    "Horizontal pixels left for image < 0: available=" + std::to_string(availableWidth) +
-                    ", window=" + std::to_string(windowWidth) + ", mapReserved=" + std::to_string(mapReserved));
-            }
-
-            // Calculate scale based on available width and full window height
-            float scaleX = availableWidth / textureWidth;
-            float scaleY = windowHeight / textureHeight;
-            scale = std::min(scaleX, scaleY);
-
-            sprite->setScale({scale, scale});
-
-            // Set rotation origin to center for proper rotation
-            auto origSize = texture->getSize();
-            sprite->setOrigin({origSize.x / 2.0f, origSize.y / 2.0f});
-            sprite->setRotation(sf::degrees(rotation));
-
-            // Calculate scaled dimensions
-            float scaledWidth = textureWidth * scale;
-            float scaledHeight = textureHeight * scale;
-
-            // Try to center image horizontally in full window
-            posX = (windowWidth - scaledWidth) / 2.0f + scaledWidth / 2.0f;
-            posY = (windowHeight - scaledHeight) / 2.0f + scaledHeight / 2.0f;
-
-            // If image overlaps with map area (left side), move it right
-            float leftEdgeX = posX - scaledWidth / 2.0f;
-            if (leftEdgeX < mapReserved) {
-                float shiftNeeded = mapReserved - leftEdgeX;
-                posX += shiftNeeded;
-            }
-
-            sprite->setPosition({posX, posY});
-        } else {
-            // Original layout: center image in full window
-            float scaleX = windowWidth / textureWidth;
-            float scaleY = windowHeight / textureHeight;
-            scale = std::min(scaleX, scaleY);
-
-            sprite->setScale({scale, scale});
-
-            // Set rotation origin to center for proper rotation
-            auto origSize = texture->getSize();
-            sprite->setOrigin({origSize.x / 2.0f, origSize.y / 2.0f});
-            sprite->setRotation(sf::degrees(rotation));
-
-            float scaledWidth = textureWidth * scale;
-            float scaledHeight = textureHeight * scale;
-            posX = (windowWidth - scaledWidth) / 2.0f + scaledWidth / 2.0f;
-            posY = (windowHeight - scaledHeight) / 2.0f + scaledHeight / 2.0f;
-
-            sprite->setPosition({posX, posY});
-        }
+        // Set rotation origin to center for proper rotation and then apply fit layout.
+        auto origSize = texture->getSize();
+        sprite->setOrigin({origSize.x / 2.0f, origSize.y / 2.0f});
+        sprite->setRotation(sf::degrees(rotation));
+        updateSpritePositioning();
 
         // Format datetime output: skip time if 00:00:00, skip entirely if keywords start with the literal "+/-" string
         std::string dateTimeStr = getExifString(imagePath, "DateTimeOriginal");
@@ -2419,10 +2658,20 @@ class MgVwr {
                 if (experimental && mapViewer && mapViewer->isOpen()) {
                     const sf::Texture *mapTexture = mapViewer->getTexture();
                     if (mapTexture) {
+                        bool skipMapForwarding = false;
+                        if (const auto *mouseButtonEvent = event->getIf<sf::Event::MouseButtonPressed>()) {
+                            skipMapForwarding = (mouseButtonEvent->button == sf::Mouse::Button::Right);
+                        }
+                        if (skipMapForwarding) {
+                            // Right click opens app context menu instead of forwarding to map.
+                            mapTexture = nullptr;
+                        }
+                    }
+                    if (mapTexture) {
                         auto windowSize = window->getSize();
                         auto mapSize = mapTexture->getSize();
                         float mapX = 0.f;
-                        float mapY = (windowSize.y - mapSize.y) / 2.0f;
+                        float mapY = getInlineMapY(windowSize.y, mapSize.y);
 
                         // Extract mouse position from event (default to off-screen if not a mouse event)
                         sf::Vector2i mousePos(-1000, -1000); // Default off-screen
@@ -2456,10 +2705,29 @@ class MgVwr {
                 if (event->is<sf::Event::Closed>()) {
                     window->close();
                 } else if (const auto *keyEvent = event->getIf<sf::Event::KeyPressed>()) {
+                    if (contextMenuVisible && keyEvent->code == sf::Keyboard::Key::Escape) {
+                        closeContextMenu();
+                        continue;
+                    }
                     handleKeyPress(*keyEvent);
                 } else if (const auto *mouseEvent = event->getIf<sf::Event::MouseButtonPressed>()) {
+                    sf::Vector2f clickPos(mouseEvent->position.x, mouseEvent->position.y);
+
+                    if (mouseEvent->button == sf::Mouse::Button::Right) {
+                        openContextMenu(clickPos);
+                        continue;
+                    }
+
+                    if (contextMenuVisible) {
+                        if (mouseEvent->button == sf::Mouse::Button::Left) {
+                            handleContextMenuClick(clickPos);
+                        } else {
+                            closeContextMenu();
+                        }
+                        continue;
+                    }
+
                     if (mouseEvent->button == sf::Mouse::Button::Left) {
-                        sf::Vector2f clickPos(mouseEvent->position.x, mouseEvent->position.y);
                         bool clickHandled = false;
 
                         // Check if click is on any navigation arrow
@@ -2541,8 +2809,8 @@ class MgVwr {
                         if (mapTexture) {
                             auto windowSize = window->getSize();
                             auto mapSize = mapTexture->getSize();
-                            float mapX = windowSize.x - mapSize.x;
-                            float mapY = (windowSize.y - mapSize.y) / 2.0f;
+                            float mapX = 0.f;
+                            float mapY = getInlineMapY(windowSize.y, mapSize.y);
 
                             // Check if mouse is over map area - if it is, don't process wheel for images
                             sf::Vector2i mousePos = wheelEvent->position;
@@ -2554,6 +2822,17 @@ class MgVwr {
                     }
 
                     if (shouldProcessWheel) {
+                        bool ctrlHeld = sf::Keyboard::isKeyPressed(sf::Keyboard::Key::LControl) ||
+                                        sf::Keyboard::isKeyPressed(sf::Keyboard::Key::RControl);
+
+                        if (ctrlHeld) {
+                            sf::Vector2f cursorPos(static_cast<float>(wheelEvent->position.x),
+                                                   static_cast<float>(wheelEvent->position.y));
+                            if (zoomImageAtCursor(cursorPos, wheelEvent->delta)) {
+                                continue;
+                            }
+                        }
+
                         bool shiftHeld = sf::Keyboard::isKeyPressed(sf::Keyboard::Key::LShift) ||
                                          sf::Keyboard::isKeyPressed(sf::Keyboard::Key::RShift);
 
@@ -2660,9 +2939,9 @@ class MgVwr {
                     sf::Sprite mapSprite(*mapTexture);
                     auto windowSize = window->getSize();
                     auto mapSize = mapTexture->getSize();
-                    // Position on left side, vertically centered
+                    // Position on left side, anchored to bottom
                     float mapX = 0.f;
-                    float mapY = (windowSize.y - mapSize.y) / 2.0f;
+                    float mapY = getInlineMapY(windowSize.y, mapSize.y);
                     mapSprite.setPosition(sf::Vector2f(mapX, mapY));
                     window->draw(mapSprite);
                 }
@@ -2687,6 +2966,8 @@ class MgVwr {
             if (showHelp) {
                 drawHelp(window, helpLines, uiFont, getCalculatedFontSize(), config);
             }
+
+            drawContextMenu();
 
             window->display();
 
@@ -2742,7 +3023,7 @@ class MgVwr {
             const float paddingX = 12.0f;
             const float paddingY = 8.0f;
             sf::Vector2f boxSize(bounds.size.x + paddingX * 2.0f, bounds.size.y + paddingY * 2.0f);
-            sf::Vector2f boxPos(15.0f, window->getSize().y - boxSize.y - 15.0f);
+            sf::Vector2f boxPos(15.0f, getBottomLeftOverlayY(boxSize.y));
 
             sf::RectangleShape background(boxSize);
             background.setPosition(boxPos);
@@ -2791,9 +3072,29 @@ class MgVwr {
 
             float padding = 12.0f;
             sf::Vector2f boxSize(maxWidth + padding * 2, lines.size() * lineSpacing + padding * 2);
-            // Position at bottom left, leave space for 2 lines of navigation text below (yellow text)
-            float reservedSpaceBelow = lineSpacing * 2 + padding * 2 + 15.0f;
-            sf::Vector2f boxPos(15.0f, window->getSize().y - boxSize.y - reservedSpaceBelow);
+
+            // Place filter box directly above active nav/jump message when present.
+            float boxY = getBottomLeftOverlayY(boxSize.y);
+            const float stackGap = 8.0f;
+            const float navPaddingY = 8.0f;
+
+            auto computeBottomOverlayTop = [&](const std::string &message) -> float {
+                sf::Text navText(uiFont, message, getCalculatedFontSize());
+                sf::FloatRect navBounds = navText.getLocalBounds();
+                sf::Vector2f navSize(navBounds.size.x + 12.0f * 2.0f, navBounds.size.y + navPaddingY * 2.0f);
+                return getBottomLeftOverlayY(navSize.y);
+            };
+
+            if (!navigationMessage.empty()) {
+                float navTop = computeBottomOverlayTop(navigationMessage);
+                boxY = navTop - boxSize.y - stackGap;
+            } else if (jumpedToOldest) {
+                float navTop = computeBottomOverlayTop("Jumped to 1st image in folder");
+                boxY = navTop - boxSize.y - stackGap;
+            }
+
+            boxY = std::max(0.0f, boxY);
+            sf::Vector2f boxPos(15.0f, boxY);
 
             sf::RectangleShape bg(boxSize);
             bg.setPosition(boxPos);
@@ -2822,14 +3123,17 @@ class MgVwr {
         if (uiFontLoaded) {
             sf::Text text(uiFont, navigationMessage, getCalculatedFontSize());
 
-            // Use red for "Reached" messages (boundary warnings), yellow for others
-            text.setFillColor(navigationMessage.find("Reached") == 0 ? sf::Color::Red : sf::Color::Yellow);
+            bool isZoomBoundary =
+                navigationMessage == "Reached maximum zoom" || navigationMessage == "Reached minimum zoom";
+            // Keep folder boundary warnings red; keep zoom limit messages yellow.
+            text.setFillColor((navigationMessage.find("Reached") == 0 && !isZoomBoundary) ? sf::Color::Red
+                                                                                          : sf::Color::Yellow);
 
             sf::FloatRect bounds = text.getLocalBounds();
             const float paddingX = 12.0f;
             const float paddingY = 8.0f;
             sf::Vector2f boxSize(bounds.size.x + paddingX * 2.0f, bounds.size.y + paddingY * 2.0f);
-            sf::Vector2f boxPos(15.0f, window->getSize().y - boxSize.y - 15.0f);
+            sf::Vector2f boxPos(15.0f, getBottomLeftOverlayY(boxSize.y));
 
             sf::RectangleShape background(boxSize);
             background.setPosition(boxPos);
@@ -2883,27 +3187,8 @@ class MgVwr {
         if (!experimental || !mapViewer || !mapViewer->isOpen())
             return;
 
-        // Draw coordinates and zoom above map on left side
-        char coordStr[64];
-        snprintf(coordStr, sizeof(coordStr), "%.4f, %.4f z%d", mapViewer->getCenterLat(), mapViewer->getCenterLon(),
-                 mapViewer->getCurrentZoom());
-
-        sf::Text coordText(uiFont, coordStr);
-        coordText.setFillColor(sf::Color::White);
-        coordText.setCharacterSize(getCalculatedFontSize());
-
         auto windowSize = window->getSize();
         const sf::Texture *mapTexture = mapViewer->getTexture();
-        if (mapTexture) {
-            auto mapSize = mapTexture->getSize();
-            float mapX = 0.f;
-            float mapY = (windowSize.y - mapSize.y) / 2.0f;
-
-            sf::FloatRect textBounds = coordText.getLocalBounds();
-            // Position above map, left aligned with padding and blank line
-            coordText.setPosition(sf::Vector2f(mapX + 5.f, mapY - textBounds.size.y - getCalculatedFontSize() - 15.f));
-            window->draw(coordText);
-        }
 
         // Draw "Loading map" text below the map if tiles are loading
         if (mapViewer->isLoadingTiles()) {
@@ -2924,7 +3209,7 @@ class MgVwr {
             if (mapTexture) {
                 auto mapSize = mapTexture->getSize();
                 float mapX = 0.f;
-                float mapY = (windowSize.y - mapSize.y) / 2.0f;
+                float mapY = getInlineMapY(windowSize.y, mapSize.y);
 
                 sf::FloatRect loadingBounds = loadingText.getLocalBounds();
                 loadingText.setPosition(sf::Vector2f(mapX + 5.f, mapY + mapSize.y + 5.f));
@@ -2972,8 +3257,7 @@ class MgVwr {
         lines.push_back(indexLine);
         lines.push_back("");
         const std::string installText = "Install Exiftool";
-        // Dynamic map text: "Hide map" when map is open, "Show on map" when closed
-        const std::string showOnMapText = (mapViewer && mapViewer->isOpen()) ? "Hide map" : "Show on map";
+        const std::string showOnMapText = "Show on map";
         if (!exiftoolAvailable) {
             lines.push_back(installText);
             lines.push_back("");
@@ -3055,7 +3339,7 @@ class MgVwr {
 
         // Add embedded map link if GPS coordinates are available
         bool hasValidGps = hasGpsLatitude(imagePath);
-        if (hasValidGps) {
+        if (hasValidGps && !(mapViewer && mapViewer->isOpen())) {
             lines.push_back("");
             lines.push_back(showOnMapText);
         }
@@ -3064,7 +3348,12 @@ class MgVwr {
         if (hasValidGps && !maps.empty()) {
             lines.push_back(""); // Blank line before maps
             for (const auto &m : maps) {
-                lines.push_back(m.name);
+                std::string lowerName = m.name;
+                std::transform(lowerName.begin(), lowerName.end(), lowerName.begin(),
+                               [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+                if (lowerName.find("google") == std::string::npos) {
+                    lines.push_back(m.name);
+                }
             }
         }
 
@@ -3315,10 +3604,8 @@ class MgVwr {
             break;
 
         case sf::Keyboard::Key::C:
-            if (key.control && !allImagePaths.empty()) {
-                std::string fullPath = toUtf8String(allImagePaths[currentIndex]);
-                sf::String clip = sf::String::fromUtf8(fullPath.begin(), fullPath.end());
-                sf::Clipboard::setString(clip);
+            if (key.control) {
+                copyImagePathToClipboard();
             }
             break;
 

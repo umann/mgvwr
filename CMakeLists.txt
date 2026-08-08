@@ -73,7 +73,7 @@ set(SFML_STATIC_LIBRARIES TRUE)
 find_package(SFML 3.0 COMPONENTS Graphics Window System Network REQUIRED)
 
 # Add executable
-add_executable(mgvwr src/main.cpp src/map_viewer.cpp src/config.cpp src/poor_mans_exiftool.cpp src/utils.cpp src/help.cpp)
+add_executable(mgvwr src/main.cpp src/cli.cpp src/map_viewer.cpp src/config.cpp src/poor_mans_exiftool.cpp src/utils.cpp src/help.cpp src/encoding_utils.cpp)
 
 # Link libraries
 target_link_libraries(mgvwr PRIVATE SFML::Graphics SFML::Window SFML::System SFML::Network yaml-cpp pantor::inja)
