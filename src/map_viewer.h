@@ -44,6 +44,13 @@ public:
     
     // Get folder navigation request: -1 for prev folder, 0 for none, 1 for next folder
     int getFolderNavigationRequest();
+
+    // Zoom controls (return true when zoom changed)
+    bool zoomIn();
+    bool zoomOut();
+
+    // Last zoom boundary message (empty when none)
+    const std::string& getZoomBoundaryMessage() const { return zoomBoundaryMessage; }
     
     // Check if close was requested
     bool isCloseRequested() const { return closeRequested; }
@@ -158,6 +165,9 @@ private:
     int tilesLoaded;        // Tiles successfully loaded
     bool isLoadingNewLocation;  // Flag to show white screen while loading new location
     bool isDownloadingTiles;    // Flag set when actively downloading tiles (even during pan/drag)
+
+    // User feedback when trying to zoom beyond limits
+    std::string zoomBoundaryMessage;
     
     // Navigation request tracking
     int navigationRequest = 0;       // -1 for prev, 0 for none, 1 for next (images)

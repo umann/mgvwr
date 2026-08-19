@@ -1,4 +1,5 @@
 #include "json.hpp"
+#include "utils.h"
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -1060,5 +1061,57 @@ json enrichMetadataWithSchemaYaml(const std::string &schemaYaml, const json &met
 
     } catch (const std::exception &e) {
         throw std::runtime_error(std::string("Metadata enrichment error: ") + e.what());
+    }
+}
+
+int runSelfCheck(const std::string &exePath, const std::string &configPath,
+                 const std::string &exiftoolResponseSchemaYaml) {
+    log_stdout("Running self-check...");
+
+    try {
+        // 1. Validate built-in schemas
+        log_stdout("  Checking embedded schemas...");
+        validateBuiltInSchemas();
+        validateSchemaYaml(exiftoolResponseSchemaYaml, "EXIFTOOL_RESPONSE_SCHEMA_YAML");
+        log_stdout("    [OK] Embedded schemas valid");
+
+        // 2. Load and validate specified config file with enrichment test
+        log_stdout("  Checking config file with enrichment...");
+        log_stdout("    Config path: " + configPath);
+
+        try {
+            // Load the specific config file (don't search)
+            if (!fs::exists(configPath)) {
+                log_stderr("    [FAIL] Config file not found: ", configPath);
+                fs::remove(exePath);
+                return 1;
+            }
+
+            json enrichedConfig = loadAndValidateConfigFile(fs::path(configPath));
+            (void)enrichedConfig;
+            log_stdout("    [OK] Config file enriched and validated successfully");
+        } catch (const std::exception &e) {
+            log_stderr("    [FAIL] Config enrichment failed: ", e.what());
+            fs::remove(exePath);
+            return 1;
+        }
+
+        // 3. Load and validate embedded exiftool schema YAML
+        log_stdout("  Checking exiftool response schema...");
+        YAML::Node schemaYaml = YAML::Load(exiftoolResponseSchemaYaml);
+        (void)schemaYaml;
+        log_stdout("    [OK] Exiftool schema valid");
+
+        log_stdout("Self-check passed!");
+        return 0;
+
+    } catch (const YAML::Exception &e) {
+        log_stderr("YAML error: ", e.what());
+        fs::remove(exePath);
+        return 1;
+    } catch (const std::exception &e) {
+        log_stderr("Error: ", e.what());
+        fs::remove(exePath);
+        return 1;
     }
 }

@@ -83,7 +83,7 @@ path_classifications:
   - pattern: '/(\d{4})/(\d{2})/(\d{2})(?:/|$)'
     names: ["year", "month", "day"]
   - pattern: '/split/(\w+)/(\d{5})/(\w+)(?:/|$)'
-    names: ["owner", "year", "film roll"]
+    names: ["archive", "year", "film roll"]
 image_file:
   supported_suffixes: [".jpg", ".jpeg", ".png", ".bmp", ".gif", ".tiff"]
 watched_folders:
