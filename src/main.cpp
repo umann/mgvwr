@@ -1,7 +1,11 @@
 #include "config.h"
+#include "datetime_utils.h"
+#include "exiftool_response_schema.h"
 #include "help.h"
 #include "json.hpp"
 #include "map_viewer.h"
+#include "metadata.h"
+#include "metadata_cache.h"
 #include "poor_mans_exiftool.h"
 #include "utils.h"
 #include <SFML/Graphics.hpp>
@@ -9,14 +13,17 @@
 #include <algorithm>
 #include <cctype>
 #include <chrono>
+#include <cmath>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <deque>
 #include <filesystem>
 #include <fstream>
 #include <inja/inja.hpp>
 #include <iomanip>
 #include <iostream>
+#include <limits>
 #include <map>
 #include <mutex>
 #include <optional>
@@ -27,12 +34,16 @@
 #include <string>
 #include <thread>
 #include <tuple>
+#include <unordered_set>
 #include <vector>
 #include <yaml-cpp/yaml.h>
 
 #ifdef _WIN32
-#include <windows.h>
 #include <regex>
+#include <windows.h>
+#endif
+
+#ifdef _WIN32
 #include <shellapi.h>
 #include <tlhelp32.h>
 #endif
@@ -45,76 +56,6 @@ using ImageMetadataCache = std::map<fs::path, json>;
 static std::string g_exiftoolPath;
 
 // POOR_MANS_SUPPORTED_SUFFIXES = {".jpg", ".jpeg"}
-
-// Embedded schema YAML as a string constant
-static constexpr const char *EXIFTOOL_RESPONSE_SCHEMA_YAML = R"(
-type: array
-items:  
-  type: object
-  additionalProperties: false
-  properties:
-    SourceFile:
-      type: string
-      minLength: 1
-      example: "F:/photos/2026/01/02/kornel_20260102_114713.jpg"
-    DateTimeOriginal:
-      type: string
-      pattern: "^\\d{4}:\\d{2}:\\d{2} \\d{2}:\\d{2}:\\d{2}$"
-      default: "0000:00:00 00:00:00"
-      example: "2026:01:02 11:47:14"
-    City:
-      type: string
-      default: ""
-      example: "Budapest"
-    Location:
-      type: string
-      default: ""
-      example: "Margit-sziget"
-    Country:
-      type: string
-      default: ""
-      example: "Belgium"
-    State:
-      type: string
-      default: ""
-      example: "Pest megye"
-    Description:
-      type: string
-      default: ""
-      example: "A beautiful landscape photo."
-    Orientation:
-      type: integer
-      minimum: 1
-      maximum: 8
-      default: 1
-      example: 7
-    Keywords:
-      type: array
-      items:
-        type: string
-        minLength: 1
-        example: "apple"
-      default: []
-      example: ["apple", "banana"]
-    GPSLatitude:
-      type: ["number", "null"]
-      minimum: -90
-      maximum: 90
-      default: null
-      example: 47.675997
-    GPSLongitude:
-      type: ["number", "null"]
-      minimum: -180
-      maximum: 180
-      default: null
-      example: 19.1444994
-    filters:
-      type: object
-      additionalProperties: false
-      default: {}
-  required:
-    - SourceFile
-)";
 
 // Path classification structure
 struct PathClassification {
@@ -270,60 +211,6 @@ bool enforceSingleInstance() {
 #endif
 }
 
-// Check if exiftool is available in PATH and return full path
-std::pair<bool, std::string> findExiftool() {
-#ifdef _WIN32
-    std::string command = "where";
-    std::string stderr_redirect = "2>nul";
-#else
-    std::string command = "which";
-    std::string stderr_redirect = "2>/dev/null";
-#endif
-
-    FILE *pipe = popen((command + " exiftool " + stderr_redirect).c_str(), "r");
-    if (!pipe) {
-        log_stdout("No exiftool found");
-        return {false, ""};
-    }
-
-    char buffer[256];
-    while (fgets(buffer, sizeof(buffer), pipe) != nullptr) {
-        std::string line = buffer;
-        // Remove trailing newline
-        if (!line.empty() && line.back() == '\n') {
-            line.pop_back();
-        }
-        if (line.empty())
-            continue;
-
-#ifdef _WIN32
-        // Windows: verify line ends with .exe or .bat
-        std::string lower = line;
-        std::transform(lower.begin(), lower.end(), lower.begin(), ::tolower);
-        if (lower.size() < 4) {
-            continue;
-        }
-        std::string suffix = lower.substr(lower.size() - 4);
-        if (suffix != ".exe" && suffix != ".bat") {
-            continue;
-        }
-#endif
-
-        log_stdout("Exiftool found at ", line);
-        pclose(pipe);
-        return {true, line};
-    }
-
-    pclose(pipe);
-    log_stdout("No exiftool found");
-    return {false, ""};
-}
-
-// Extract metadata using exiftool
-static const std::vector<std::string> EXIF_STRING_KEYS = {
-    "City", "Country", "DateTimeOriginal", "Description", "Location", "Orientation", "State",
-};
-
 // Configuration structures
 struct Filter {
     std::string expression;
@@ -336,107 +223,6 @@ struct Map {
     int zoom = 0;
     std::string gui_url_template;
 };
-
-// Unified exiftool extraction for one or more image paths
-// Returns: map<image_path, metadata object>
-std::map<fs::path, json> extractExiftoolData(const std::vector<fs::path> &imagePaths) {
-
-    std::map<fs::path, json> results;
-
-    if (imagePaths.empty() || g_exiftoolPath.empty()) {
-        return results;
-    }
-
-    try {
-        // Build CLI flags for all required keys
-        std::string cliFlags = "-j -n -q";
-
-        for (const auto &key : EXIF_STRING_KEYS) {
-            cliFlags += " -" + key;
-        }
-        cliFlags += " -Keywords -GPSLatitude -GPSLongitude";
-
-        // Build image paths argument
-        std::string imagePathsArg;
-        for (size_t i = 0; i < imagePaths.size(); ++i) {
-            if (i > 0)
-                imagePathsArg += "\" \"";
-            imagePathsArg += imagePaths[i].string();
-        }
-
-        // Construct platform-specific command
-        std::string cmd;
-        std::string exiftoolPathFixed = g_exiftoolPath;
-
-#ifdef _WIN32
-        // Windows: convert any forward slashes to backslashes for exiftool
-        for (char &c : exiftoolPathFixed) {
-            if (c == '/')
-                c = '\\';
-        }
-        cmd = "cmd /c \"\"" + exiftoolPathFixed + "\" " + cliFlags + " \"" + imagePathsArg + "\"\"";
-#else
-        // Unix/Linux: convert any backslashes to forward slashes
-        for (char &c : exiftoolPathFixed) {
-            if (c == '\\')
-                c = '/';
-        }
-        cmd = "\"" + exiftoolPathFixed + "\" " + cliFlags + " \"" + imagePathsArg + "\"";
-#endif
-
-        log_stdout("DEBUG", "Exiftool batch command: ", cmd);
-
-        // Execute exiftool
-        FILE *pipe = popen(cmd.c_str(), "r");
-        if (!pipe) {
-            log_stdout("DEBUG", "popen failed for exiftool");
-            return results;
-        }
-
-        std::string output;
-        char buffer[4096];
-        while (fgets(buffer, sizeof(buffer), pipe) != nullptr) {
-            output += buffer;
-        }
-        int exitCode = pclose(pipe);
-
-        log_stdout("DEBUG", "exiftool exit code: ", exitCode, ", output size: ", output.size(), " bytes");
-
-        if (exitCode != 0) {
-            log_stdout("DEBUG", "exiftool failed or returned no output");
-            return results;
-        }
-
-        // Parse JSON response (should be array of objects that is check with schema)
-        auto jsonData = json::parse(output);
-
-        // Apply schema defaults and validate exiftool response
-        try {
-            jsonData = enrichAndValidateJsonWithSchemaYaml(EXIFTOOL_RESPONSE_SCHEMA_YAML, jsonData);
-        } catch (const std::exception &e) {
-            log_stdout("DEBUG", "Exiftool response schema validation failed: ", e.what());
-            return results;
-        }
-
-        for (const auto &record : jsonData) {
-            if (!record.is_object() || !record.contains("SourceFile")) {
-                continue;
-            }
-            try {
-                fs::path imagePath(record["SourceFile"].get<std::string>());
-                results[imagePath] = record;
-                log_stdout("DEBUG", "Extracted metadata for ", imagePath.filename().string());
-            } catch (const std::exception &e) {
-                log_stdout("DEBUG", "Error processing record: ", e.what());
-            }
-        }
-
-    } catch (const std::exception &e) {
-        log_stdout("DEBUG", "Exception in extractExiftoolData: ", e.what());
-    }
-
-    return results;
-}
 
 // Get default cache directory location based on platform environment variables
 // Returns base cache directory (without subdirectories like "osm")
@@ -451,6 +237,71 @@ static fs::path getDefaultCacheLocation() {
     } else {
         return fs::path(".") / "cache";
     }
+}
+
+static fs::path getThumbnailCacheLocation(const fs::path &cacheRoot) {
+    return cacheRoot / "thumb";
+}
+
+static fs::path getThumbnailCacheLocation() {
+    return getThumbnailCacheLocation(getDefaultCacheLocation());
+}
+
+static std::string hashThumbnailCacheKey(const fs::path &imagePath) {
+    std::string payload = normalizePath(imagePath).string();
+
+    uint64_t hash = 1469598103934665603ULL;
+    for (unsigned char ch : payload) {
+        hash ^= ch;
+        hash *= 1099511628211ULL;
+    }
+
+    std::ostringstream oss;
+    oss << std::hex << std::setw(16) << std::setfill('0') << hash;
+    return oss.str();
+}
+
+static fs::path getThumbnailCacheFilePath(const fs::path &imagePath, const fs::path &cacheRoot) {
+    std::string cacheKey = hashThumbnailCacheKey(imagePath);
+    return getThumbnailCacheLocation(cacheRoot) / cacheKey.substr(0, 2) / (cacheKey + ".png");
+}
+
+static fs::path getThumbnailCacheFilePath(const fs::path &imagePath) {
+    return getThumbnailCacheFilePath(imagePath, getDefaultCacheLocation());
+}
+
+static bool writeThumbnailCacheFile(const fs::path &imagePath, const fs::path &thumbCacheFile) {
+    sf::Texture sourceTexture;
+    if (!sourceTexture.loadFromFile(imagePath.string())) {
+        return false;
+    }
+
+    auto sourceSize = sourceTexture.getSize();
+    const unsigned int maxThumbEdge = 256;
+    float scaleX = static_cast<float>(maxThumbEdge) / static_cast<float>(sourceSize.x);
+    float scaleY = static_cast<float>(maxThumbEdge) / static_cast<float>(sourceSize.y);
+    float scale = std::min(scaleX, scaleY);
+    unsigned int thumbWidth = std::max(1u, static_cast<unsigned int>(std::round(sourceSize.x * scale)));
+    unsigned int thumbHeight = std::max(1u, static_cast<unsigned int>(std::round(sourceSize.y * scale)));
+
+    sf::RenderTexture thumbTarget;
+    if (!thumbTarget.resize(sf::Vector2u(thumbWidth, thumbHeight))) {
+        return false;
+    }
+
+    thumbTarget.clear(sf::Color::Transparent);
+    sf::Sprite thumbSprite(sourceTexture);
+    thumbSprite.setScale({scale, scale});
+    thumbTarget.draw(thumbSprite);
+    thumbTarget.display();
+
+    sf::Image thumbImage = thumbTarget.getTexture().copyToImage();
+    if (!thumbImage.saveToFile(thumbCacheFile)) {
+        log_stdout("DEBUG", "Failed to save thumbnail cache file: ", thumbCacheFile.string());
+        return false;
+    }
+
+    return true;
 }
 
 unsigned int parseSizeValue(const std::string &sizeStr, unsigned int maxValue) {
@@ -501,6 +352,7 @@ class MgVwr {
     std::vector<fs::path> allDirectories;
     fs::path currentWatchedFolder;
     fs::path currentFolder; // Currently displayed folder
+    bool folderModeEligible = false;
     size_t currentIndex = 0;
     std::shared_ptr<sf::RenderWindow> window;
     std::shared_ptr<sf::Sprite> sprite;
@@ -515,6 +367,10 @@ class MgVwr {
     bool isFullscreen = true;
     bool hasStoredWindowState = false;
     unsigned int fullscreenWidth; // Cached fullscreen width for font calculations
+    fs::path appIconPath;
+    sf::Image appIconImage;
+    bool appIconLoaded = false;
+    bool appIconLoadAttempted = false;
 
     // Image metadata cache: path -> { EXIF strings, Keywords array, GPSLatitude/GPSLongitude }
     ImageMetadataCache imageMetadataCache;
@@ -533,10 +389,15 @@ class MgVwr {
     bool exiftoolAvailable = false;
     bool hasShownFirstImage = false;
     bool wasReloaded = false; // Track if we terminated another instance
+    bool metadataCacheReady = false;
+    fs::path metadataCacheFilePath;
 
     // Navigation messages
     std::string navigationMessage;
     float navigationMessageTime = 0.0f;
+    bool thumbnailCollectionMessageActive = false;
+    bool metadataCollectionMessageActive = false;
+    bool mapTileDownloadMessageActive = false;
 
     // Font configuration
     json fontSizeConfig;
@@ -545,6 +406,7 @@ class MgVwr {
     bool quietMode;
     bool singleInstanceMode;
     bool experimental;
+    std::map<fs::path, bool> watchedFolderAutoScan;
     std::vector<fs::path> watchedFolders;
     bool windowModeIsDefault;
     json defaultWindowWidth;
@@ -581,6 +443,41 @@ class MgVwr {
     bool sortByNameCurrentFolder = false;
     bool deferMetadataCurrentFolder = false;
     bool isHandCursorActive = false; // Track if hand cursor is currently set
+    float fitImageScale = 1.0f;
+    float currentImageScale = 1.0f;
+
+    // Thumbnail mode
+    bool thumbnailMode = false;
+    int thumbnailColumns = 8;
+    int thumbnailScrollRow = 0;
+    bool thumbnailScrollbarDragging = false;
+    float thumbnailScrollbarDragOffset = 0.0f;
+    std::vector<std::pair<size_t, sf::FloatRect>> thumbnailClickAreas;
+    struct FolderModeEntry {
+        fs::path folderPath;
+        fs::path representativeImage;
+        std::string label;
+        bool isParentPlaceholder = false;
+    };
+    bool folderMode = false;
+    bool watchedFoldersMode = false;
+    std::vector<FolderModeEntry> folderModeEntries;
+    std::vector<std::pair<size_t, sf::FloatRect>> folderModeClickAreas;
+    size_t folderModeFocusIndex = 0;
+    std::vector<fs::path> seenImageFolders;
+    std::map<fs::path, std::shared_ptr<sf::Texture>> thumbnailTextureCache;
+    std::deque<size_t> thumbnailLoadQueue;
+    std::unordered_set<size_t> thumbnailQueuedIndices;
+    std::unordered_set<size_t> thumbnailReadyIndices;
+    std::deque<size_t> folderThumbnailLoadQueue;
+    std::unordered_set<size_t> folderThumbnailQueuedIndices;
+    std::unordered_set<size_t> folderThumbnailReadyIndices;
+    bool folderThumbQueueSeeded = false;
+    std::chrono::steady_clock::time_point lastThumbnailClickTime = std::chrono::steady_clock::time_point::min();
+    size_t lastThumbnailClickedIndex = std::numeric_limits<size_t>::max();
+    std::chrono::steady_clock::time_point lastFolderModeClickTime = std::chrono::steady_clock::time_point::min();
+    size_t lastFolderModeClickedIndex = std::numeric_limits<size_t>::max();
+    fs::path pendingFolderModeFocusFolder;
 
     // Navigation arrow system
     enum class NavArrow { Left, Right, Up, Down };
@@ -591,8 +488,1697 @@ class MgVwr {
     bool showHelp = false;
     std::vector<std::string> helpLines;
 
+    enum class ContextMenuAction {
+        None,
+        CopyImagePath,
+        CopyCoordinates,
+        ToggleMap,
+        OpenGoogleMaps,
+        ShowAllInMap,
+        ToggleThumbnails,
+        ToggleFullscreen,
+        ShowHelp,
+    };
+
+    struct ContextMenuItem {
+        std::string label;
+        bool enabled = true;
+        ContextMenuAction action = ContextMenuAction::None;
+        int mapIndex = -1;
+    };
+
+    bool contextMenuVisible = false;
+    sf::Vector2f contextMenuPos{0.f, 0.f};
+    std::vector<ContextMenuItem> contextMenuItems;
+
     std::vector<std::string> supportedSuffixes;
     std::vector<PathClassification> pathClassifications;
+
+    float getInlineMapY(unsigned int windowHeight, unsigned int mapHeight) const {
+        if (windowHeight <= mapHeight) {
+            return 0.0f;
+        }
+        return static_cast<float>(windowHeight - mapHeight);
+    }
+
+    float getBottomLeftOverlayY(float boxHeight, float margin = 15.0f) const {
+        float y = static_cast<float>(window->getSize().y) - boxHeight - margin;
+
+        if (experimental && mapViewer && mapViewer->isOpen()) {
+            const sf::Texture *mapTexture = mapViewer->getTexture();
+            if (mapTexture) {
+                float mapTopY = getInlineMapY(window->getSize().y, mapTexture->getSize().y);
+                y = std::min(y, mapTopY - boxHeight - margin);
+            }
+        }
+
+        return std::max(0.0f, y);
+    }
+
+    static void latLonToPixelAtZoom(double lat, double lon, int zoom, double &pixX, double &pixY) {
+        constexpr double PI = 3.14159265358979323846;
+        const double n = std::pow(2.0, zoom);
+        pixX = (lon + 180.0) / 360.0 * n * 256.0;
+        const double latRad = lat * PI / 180.0;
+        pixY = (1.0 - std::asinh(std::tan(latRad)) / PI) / 2.0 * n * 256.0;
+    }
+
+    sf::FloatRect getInlineMapRect() const {
+        if (!(experimental && mapViewer && mapViewer->isOpen())) {
+            return sf::FloatRect();
+        }
+        const sf::Texture *mapTexture = mapViewer->getTexture();
+        if (!mapTexture) {
+            return sf::FloatRect();
+        }
+
+        auto windowSize = window->getSize();
+        auto mapSize = mapTexture->getSize();
+        float mapX = 0.f;
+        float mapY = getInlineMapY(windowSize.y, mapSize.y);
+        return sf::FloatRect(sf::Vector2f(mapX, mapY),
+                             sf::Vector2f(static_cast<float>(mapSize.x), static_cast<float>(mapSize.y)));
+    }
+
+    bool currentImageHasGps() const {
+        return !allImagePaths.empty() && currentIndex < allImagePaths.size() &&
+               hasGpsLatitude(allImagePaths[currentIndex]);
+    }
+
+    fs::path currentMapSubjectImage() const {
+        if (thumbnailMode && folderMode && folderModeFocusIndex < folderModeEntries.size()) {
+            const auto &entry = folderModeEntries[folderModeFocusIndex];
+            if (!entry.isParentPlaceholder && !entry.representativeImage.empty()) {
+                return entry.representativeImage;
+            }
+            return fs::path();
+        }
+
+        if (!allImagePaths.empty() && currentIndex < allImagePaths.size()) {
+            return allImagePaths[currentIndex];
+        }
+        return fs::path();
+    }
+
+    bool currentMapSubjectHasGps() const {
+        const fs::path subject = currentMapSubjectImage();
+        return !subject.empty() && hasGpsLatitude(subject);
+    }
+
+    void refreshMapForFolderFocusSelection() {
+        if (!mapViewer || !mapViewer->isOpen()) {
+            return;
+        }
+        if (!(thumbnailMode && folderMode) || folderModeFocusIndex >= folderModeEntries.size()) {
+            return;
+        }
+
+        const auto &entry = folderModeEntries[folderModeFocusIndex];
+        if (entry.isParentPlaceholder || entry.representativeImage.empty()) {
+            return;
+        }
+
+        ensureMetadataForImage(entry.representativeImage);
+        updateMapViewerForImage(entry.representativeImage);
+    }
+
+    struct MapDotCandidate {
+        size_t imageIndex = 0;
+        double lat = 0.0;
+        double lon = 0.0;
+        sf::Vector2f screenPos{0.f, 0.f};
+    };
+
+    std::vector<MapDotCandidate> getInlineMapDotCandidates() const {
+        std::vector<MapDotCandidate> candidates;
+        if (!mapViewer || !mapViewer->isOpen() || allImagePaths.empty() || currentIndex >= allImagePaths.size() ||
+            currentIndex >= allDirectories.size()) {
+            return candidates;
+        }
+
+        const sf::FloatRect mapRect = getInlineMapRect();
+        if (mapRect.size.x <= 0.0f || mapRect.size.y <= 0.0f) {
+            return candidates;
+        }
+
+        const fs::path currentDir = allDirectories[currentIndex];
+        const int zoom = mapViewer->getCurrentZoom();
+        double centerPixX = 0.0;
+        double centerPixY = 0.0;
+        latLonToPixelAtZoom(mapViewer->getCenterLat(), mapViewer->getCenterLon(), zoom, centerPixX, centerPixY);
+
+        const float screenCenterX = mapRect.position.x + mapRect.size.x * 0.5f;
+        const float screenCenterY = mapRect.position.y + mapRect.size.y * 0.5f;
+
+        for (size_t i = 0; i < allImagePaths.size(); i++) {
+            if (i >= allDirectories.size() || allDirectories[i] != currentDir ||
+                !passesActiveFilter(allImagePaths[i]) || !hasGpsLatitude(allImagePaths[i])) {
+                continue;
+            }
+
+            const double lat = getGpsValueOrZero(allImagePaths[i], "GPSLatitude");
+            const double lon = getGpsValueOrZero(allImagePaths[i], "GPSLongitude");
+
+            double pointPixX = 0.0;
+            double pointPixY = 0.0;
+            latLonToPixelAtZoom(lat, lon, zoom, pointPixX, pointPixY);
+
+            const float pointX = screenCenterX + static_cast<float>(pointPixX - centerPixX);
+            const float pointY = screenCenterY + static_cast<float>(pointPixY - centerPixY);
+
+            if (pointX >= mapRect.position.x - 10.f && pointX <= mapRect.position.x + mapRect.size.x + 10.f &&
+                pointY >= mapRect.position.y - 10.f && pointY <= mapRect.position.y + mapRect.size.y + 10.f) {
+                candidates.push_back(MapDotCandidate{i, lat, lon, sf::Vector2f(pointX, pointY)});
+            }
+        }
+
+        return candidates;
+    }
+
+    size_t pickBestMapDotCandidate(const std::vector<MapDotCandidate> &candidates) {
+        if (candidates.empty()) {
+            return currentIndex;
+        }
+
+        const auto sameCoord = [](double aLat, double aLon, double bLat, double bLon) {
+            const double eps = 1e-9;
+            return std::abs(aLat - bLat) <= eps && std::abs(aLon - bLon) <= eps;
+        };
+
+        std::vector<size_t> sameSpot;
+        sameSpot.reserve(candidates.size());
+        const double refLat = candidates.front().lat;
+        const double refLon = candidates.front().lon;
+        for (const auto &c : candidates) {
+            if (sameCoord(c.lat, c.lon, refLat, refLon)) {
+                sameSpot.push_back(c.imageIndex);
+            }
+        }
+        if (sameSpot.empty()) {
+            return candidates.front().imageIndex;
+        }
+
+        auto hasValidDate = [&](size_t idx, std::string &outDate) {
+            if (idx >= allImagePaths.size()) {
+                return false;
+            }
+            ensureMetadataForImage(allImagePaths[idx]);
+            outDate = getExifString(allImagePaths[idx], "DateTimeOriginal");
+            return !outDate.empty() && outDate != "0000:00:00 00:00:00";
+        };
+
+        size_t bestByDate = std::numeric_limits<size_t>::max();
+        std::string bestDate;
+        for (size_t idx : sameSpot) {
+            std::string dt;
+            if (hasValidDate(idx, dt)) {
+                if (bestByDate == std::numeric_limits<size_t>::max() || dt < bestDate) {
+                    bestByDate = idx;
+                    bestDate = dt;
+                }
+            }
+        }
+        if (bestByDate != std::numeric_limits<size_t>::max()) {
+            return bestByDate;
+        }
+
+        size_t bestByName = sameSpot.front();
+        std::string bestName = allImagePaths[bestByName].filename().string();
+        for (size_t idx : sameSpot) {
+            const std::string name = allImagePaths[idx].filename().string();
+            if (name < bestName) {
+                bestByName = idx;
+                bestName = name;
+            }
+        }
+        return bestByName;
+    }
+
+    bool selectImageFromInlineMapDotsNear(const sf::Vector2f &cursorPos) {
+        if (!mapViewer || !mapViewer->isOpen()) {
+            return false;
+        }
+
+        constexpr float hitRadius = 24.0f; // 3 * current marker radius (8 px)
+        const float maxDist2 = hitRadius * hitRadius;
+
+        const auto candidates = getInlineMapDotCandidates();
+        std::vector<MapDotCandidate> nearest;
+        float bestDist2 = std::numeric_limits<float>::infinity();
+        for (const auto &c : candidates) {
+            const float dx = c.screenPos.x - cursorPos.x;
+            const float dy = c.screenPos.y - cursorPos.y;
+            const float d2 = dx * dx + dy * dy;
+            if (d2 > maxDist2) {
+                continue;
+            }
+
+            if (d2 + 1e-4f < bestDist2) {
+                bestDist2 = d2;
+                nearest.clear();
+                nearest.push_back(c);
+            } else if (std::abs(d2 - bestDist2) <= 1e-4f) {
+                nearest.push_back(c);
+            }
+        }
+
+        if (nearest.empty()) {
+            return false;
+        }
+
+        const size_t targetIndex = pickBestMapDotCandidate(nearest);
+        if (targetIndex >= allImagePaths.size()) {
+            return false;
+        }
+
+        if (thumbnailMode) {
+            currentIndex = targetIndex;
+            onThumbnailSelectionChanged();
+        } else {
+            loadImage(targetIndex);
+        }
+        return true;
+    }
+
+    bool isMouseOverInlineMapDot(const sf::Vector2f &cursorPos) const {
+        if (!mapViewer || !mapViewer->isOpen()) {
+            return false;
+        }
+
+        constexpr float hitRadius = 24.0f; // 3 * current marker radius (8 px)
+        const float maxDist2 = hitRadius * hitRadius;
+        for (const auto &c : getInlineMapDotCandidates()) {
+            const float dx = c.screenPos.x - cursorPos.x;
+            const float dy = c.screenPos.y - cursorPos.y;
+            if (dx * dx + dy * dy <= maxDist2) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    void showAllCurrentFolderInMap() {
+        if (!mapViewer || allImagePaths.empty() || currentIndex >= allImagePaths.size() ||
+            currentIndex >= allDirectories.size()) {
+            return;
+        }
+
+        fs::path currentDir = allDirectories[currentIndex];
+        std::vector<size_t> folderIndices;
+        folderIndices.reserve(allImagePaths.size());
+        for (size_t i = 0; i < allImagePaths.size(); i++) {
+            if (i < allDirectories.size() && allDirectories[i] == currentDir && passesActiveFilter(allImagePaths[i]) &&
+                hasGpsLatitude(allImagePaths[i])) {
+                folderIndices.push_back(i);
+            }
+        }
+        if (folderIndices.empty()) {
+            return;
+        }
+
+        double minLat = 90.0;
+        double maxLat = -90.0;
+        double minLon = 180.0;
+        double maxLon = -180.0;
+        std::vector<std::pair<double, double>> folderGpsPoints;
+        folderGpsPoints.reserve(folderIndices.size());
+        for (size_t idx : folderIndices) {
+            double lat = getGpsValueOrZero(allImagePaths[idx], "GPSLatitude");
+            double lon = getGpsValueOrZero(allImagePaths[idx], "GPSLongitude");
+            minLat = std::min(minLat, lat);
+            maxLat = std::max(maxLat, lat);
+            minLon = std::min(minLon, lon);
+            maxLon = std::max(maxLon, lon);
+            folderGpsPoints.push_back({lat, lon});
+        }
+
+        const double centerLat = (minLat + maxLat) * 0.5;
+        const double centerLon = (minLon + maxLon) * 0.5;
+
+        auto windowSize = window->getSize();
+        int mapW = parseSizeValue(mapWindowWidth, windowSize.x);
+        int mapH = parseSizeValue(mapWindowHeight, windowSize.y);
+        int fitZoom = minZoom;
+        constexpr double marginPx = 24.0;
+
+        for (int z = maxZoom; z >= minZoom; --z) {
+            double centerPixX = 0.0;
+            double centerPixY = 0.0;
+            latLonToPixelAtZoom(centerLat, centerLon, z, centerPixX, centerPixY);
+
+            bool allVisible = true;
+            for (size_t idx : folderIndices) {
+                double lat = getGpsValueOrZero(allImagePaths[idx], "GPSLatitude");
+                double lon = getGpsValueOrZero(allImagePaths[idx], "GPSLongitude");
+                double pointPixX = 0.0;
+                double pointPixY = 0.0;
+                latLonToPixelAtZoom(lat, lon, z, pointPixX, pointPixY);
+
+                double driftX = std::abs(pointPixX - centerPixX);
+                double driftY = std::abs(pointPixY - centerPixY);
+                if (driftX > (static_cast<double>(mapW) * 0.5 - marginPx) ||
+                    driftY > (static_cast<double>(mapH) * 0.5 - marginPx)) {
+                    allVisible = false;
+                    break;
+                }
+            }
+
+            if (allVisible) {
+                fitZoom = z;
+                break;
+            }
+        }
+
+        // Do not auto-zoom in beyond the configured default when points are very close.
+        fitZoom = std::min(fitZoom, defaultZoom);
+
+        mapViewer->showMap(centerLat, centerLon, fitZoom);
+        mapViewer->setGPSPoints(folderGpsPoints);
+
+        if (hasGpsLatitude(allImagePaths[currentIndex])) {
+            double lat = getGpsValueOrZero(allImagePaths[currentIndex], "GPSLatitude");
+            double lon = getGpsValueOrZero(allImagePaths[currentIndex], "GPSLongitude");
+            mapViewer->updateMarkerOnly(lat, lon);
+        }
+    }
+
+    void copyImagePathToClipboard() {
+        if (!allImagePaths.empty()) {
+            std::string fullPath = toUtf8String(allImagePaths[currentIndex]);
+            sf::String clip = sf::String::fromUtf8(fullPath.begin(), fullPath.end());
+            sf::Clipboard::setString(clip);
+        }
+    }
+
+    void copyCurrentCoordinatesToClipboard() {
+        if (allImagePaths.empty()) {
+            return;
+        }
+
+        const auto &imagePath = allImagePaths[currentIndex];
+        if (!hasGpsLatitude(imagePath)) {
+            return;
+        }
+
+        double lat = getGpsValueOrZero(imagePath, "GPSLatitude");
+        double lon = getGpsValueOrZero(imagePath, "GPSLongitude");
+
+        std::ostringstream oss;
+        oss << std::fixed << std::setprecision(6) << lat << ", " << lon;
+        sf::String clip = sf::String::fromUtf8(oss.str().begin(), oss.str().end());
+        sf::Clipboard::setString(clip);
+    }
+
+    void toggleMapForCurrentImage() {
+        if (!mapViewer || allImagePaths.empty()) {
+            return;
+        }
+
+        const auto &imagePath = allImagePaths[currentIndex];
+        if (!hasGpsLatitude(imagePath)) {
+            return;
+        }
+
+        if (mapViewer->isOpen()) {
+            mapViewer->close();
+            return;
+        }
+
+        double lat = getGpsValueOrZero(imagePath, "GPSLatitude");
+        double lon = getGpsValueOrZero(imagePath, "GPSLongitude");
+        mapViewer->showMap(lat, lon, defaultZoom);
+    }
+
+    void updateMapViewerForImage(const fs::path &imagePath) {
+        if (!mapViewer || !mapViewer->isOpen()) {
+            return;
+        }
+
+        if (hasGpsLatitude(imagePath)) {
+            double lat = getGpsValueOrZero(imagePath, "GPSLatitude");
+            double lon = getGpsValueOrZero(imagePath, "GPSLongitude");
+
+            // Only recenter map if new point is outside the center 50% visible area.
+            if (!mapViewer->isPointInStayPutArea(lat, lon)) {
+                mapViewer->updateGPS(lat, lon);
+            } else {
+                // Inside center 50% - keep map centered but update marker position.
+                mapViewer->updateMarkerOnly(lat, lon);
+            }
+        }
+
+        // Keep folder point overlays in sync with the currently selected image's folder.
+        std::vector<std::pair<double, double>> folderGpsPoints;
+        fs::path currentDir = imagePath.parent_path();
+        for (size_t i = 0; i < allImagePaths.size(); i++) {
+            if (allDirectories[i] == currentDir && hasGpsLatitude(allImagePaths[i]) &&
+                passesActiveFilter(allImagePaths[i])) {
+                double ptLat = getGpsValueOrZero(allImagePaths[i], "GPSLatitude");
+                double ptLon = getGpsValueOrZero(allImagePaths[i], "GPSLongitude");
+                folderGpsPoints.push_back({ptLat, ptLon});
+            }
+        }
+        mapViewer->setGPSPoints(folderGpsPoints);
+    }
+
+    void onThumbnailSelectionChanged() {
+        if (allImagePaths.empty() || currentIndex >= allImagePaths.size()) {
+            return;
+        }
+
+        ensureMetadataForImage(allImagePaths[currentIndex]);
+        ensureThumbnailSelectionVisible();
+        updateMapViewerForImage(allImagePaths[currentIndex]);
+    }
+
+    void openCurrentImageInGoogleMaps() {
+        if (allImagePaths.empty()) {
+            return;
+        }
+
+        const auto &imagePath = allImagePaths[currentIndex];
+        if (!hasGpsLatitude(imagePath)) {
+            return;
+        }
+
+        double lat = getGpsValueOrZero(imagePath, "GPSLatitude");
+        double lon = getGpsValueOrZero(imagePath, "GPSLongitude");
+        std::ostringstream oss;
+        oss << "https://www.google.com/maps?q=" << std::fixed << std::setprecision(6) << lat << "," << lon;
+        std::string url = oss.str();
+        openURL(url);
+    }
+
+    void openContextMenu(sf::Vector2f pos) {
+        bool hasGPS = !allImagePaths.empty() && hasGpsLatitude(allImagePaths[currentIndex]);
+        bool hasFolderGps = false;
+        if (!allImagePaths.empty() && currentIndex < allImagePaths.size() && currentIndex < allDirectories.size()) {
+            fs::path currentDir = allDirectories[currentIndex];
+            for (size_t i = 0; i < allImagePaths.size(); i++) {
+                if (i < allDirectories.size() && allDirectories[i] == currentDir &&
+                    passesActiveFilter(allImagePaths[i]) && hasGpsLatitude(allImagePaths[i])) {
+                    hasFolderGps = true;
+                    break;
+                }
+            }
+        }
+        contextMenuItems.clear();
+        contextMenuItems.push_back({"Copy image full path", true, ContextMenuAction::CopyImagePath});
+        contextMenuItems.push_back({"Copy coordinates", hasGPS, ContextMenuAction::CopyCoordinates});
+
+        if (hasGPS && mapViewer) {
+            const char *toggleText = mapViewer->isOpen() ? "Hide map" : "Show on map";
+            contextMenuItems.push_back({toggleText, true, ContextMenuAction::ToggleMap});
+            contextMenuItems.push_back({"Open in Google Maps", true, ContextMenuAction::OpenGoogleMaps});
+        }
+
+        if (mapViewer && hasFolderGps) {
+            contextMenuItems.push_back({"Show entire folder in map", true, ContextMenuAction::ShowAllInMap});
+        }
+
+        contextMenuItems.push_back({"Enter thumbnail mode", !thumbnailMode, ContextMenuAction::ToggleThumbnails});
+        contextMenuItems.push_back({"Toggle full screen", true, ContextMenuAction::ToggleFullscreen});
+        contextMenuItems.push_back({"Help", true, ContextMenuAction::ShowHelp});
+
+        contextMenuPos = pos;
+        contextMenuVisible = true;
+    }
+
+    void closeContextMenu() { contextMenuVisible = false; }
+
+    sf::Vector2f getContextMenuSize() const {
+        const float paddingX = 12.f;
+        const float paddingY = 8.f;
+        const float itemHeight = static_cast<float>(getCalculatedFontSize() + 10);
+
+        float maxLabelWidth = 0.f;
+        for (const auto &item : contextMenuItems) {
+            sf::Text text(uiFont, item.label, getCalculatedFontSize());
+            sf::FloatRect bounds = text.getLocalBounds();
+            maxLabelWidth = std::max(maxLabelWidth, bounds.size.x);
+        }
+
+        const float minMenuWidth = 280.f;
+        const float menuWidth = std::max(minMenuWidth, maxLabelWidth + paddingX * 2.f + 2.f);
+        const float menuHeight = paddingY * 2.f + itemHeight * static_cast<float>(contextMenuItems.size());
+        return sf::Vector2f(menuWidth, menuHeight);
+    }
+
+    bool handleContextMenuClick(sf::Vector2f clickPos) {
+        if (!contextMenuVisible || contextMenuItems.empty() || !uiFontLoaded) {
+            return false;
+        }
+
+        const float paddingX = 12.f;
+        const float paddingY = 8.f;
+        const float itemHeight = static_cast<float>(getCalculatedFontSize() + 10);
+        sf::Vector2f menuSize = getContextMenuSize();
+        const float menuWidth = menuSize.x;
+        const float menuHeight = menuSize.y;
+
+        auto winSize = window->getSize();
+        float menuX = std::clamp(contextMenuPos.x, 0.f, static_cast<float>(winSize.x) - menuWidth - 2.f);
+        float menuY = std::clamp(contextMenuPos.y, 0.f, static_cast<float>(winSize.y) - menuHeight - 2.f);
+        sf::FloatRect menuRect(sf::Vector2f(menuX, menuY), sf::Vector2f(menuWidth, menuHeight));
+
+        if (!menuRect.contains(clickPos)) {
+            closeContextMenu();
+            return true;
+        }
+
+        float currentY = menuY + paddingY;
+        for (const auto &item : contextMenuItems) {
+            sf::FloatRect rect(sf::Vector2f(menuX, currentY), sf::Vector2f(menuWidth, itemHeight));
+            if (rect.contains(clickPos) && item.enabled) {
+                switch (item.action) {
+                case ContextMenuAction::CopyImagePath:
+                    copyImagePathToClipboard();
+                    break;
+                case ContextMenuAction::CopyCoordinates:
+                    copyCurrentCoordinatesToClipboard();
+                    break;
+                case ContextMenuAction::ToggleMap:
+                    toggleMapForCurrentImage();
+                    break;
+                case ContextMenuAction::OpenGoogleMaps:
+                    openCurrentImageInGoogleMaps();
+                    break;
+                case ContextMenuAction::ShowAllInMap:
+                    showAllCurrentFolderInMap();
+                    break;
+                case ContextMenuAction::ToggleThumbnails:
+                    toggleThumbnailMode();
+                    break;
+                case ContextMenuAction::ToggleFullscreen:
+                    toggleWindowMode();
+                    break;
+                case ContextMenuAction::ShowHelp:
+                    showHelp = true;
+                    break;
+                case ContextMenuAction::None:
+                    break;
+                }
+                closeContextMenu();
+                return true;
+            }
+            currentY += itemHeight;
+        }
+
+        closeContextMenu();
+        return true;
+    }
+
+    void drawContextMenu() {
+        if (!contextMenuVisible || contextMenuItems.empty() || !uiFontLoaded) {
+            return;
+        }
+
+        const float paddingX = 12.f;
+        const float paddingY = 8.f;
+        const float itemHeight = static_cast<float>(getCalculatedFontSize() + 10);
+        sf::Vector2f menuSize = getContextMenuSize();
+        const float menuWidth = menuSize.x;
+        const float menuHeight = menuSize.y;
+
+        auto winSize = window->getSize();
+        float menuX = std::clamp(contextMenuPos.x, 0.f, static_cast<float>(winSize.x) - menuWidth - 2.f);
+        float menuY = std::clamp(contextMenuPos.y, 0.f, static_cast<float>(winSize.y) - menuHeight - 2.f);
+
+        sf::RectangleShape bg(sf::Vector2f(menuWidth, menuHeight));
+        bg.setPosition({menuX, menuY});
+        bg.setFillColor(sf::Color(24, 24, 24, 240));
+        bg.setOutlineColor(sf::Color(180, 180, 180));
+        bg.setOutlineThickness(1.f);
+        window->draw(bg);
+
+        sf::Vector2f mousePos(static_cast<float>(sf::Mouse::getPosition(*window).x),
+                              static_cast<float>(sf::Mouse::getPosition(*window).y));
+        float currentY = menuY + paddingY;
+        for (const auto &item : contextMenuItems) {
+            sf::FloatRect rect(sf::Vector2f(menuX, currentY), sf::Vector2f(menuWidth, itemHeight));
+            bool hovered = rect.contains(mousePos);
+
+            if (hovered && item.enabled) {
+                sf::RectangleShape hoverBg(sf::Vector2f(menuWidth, itemHeight));
+                hoverBg.setPosition({menuX, currentY});
+                hoverBg.setFillColor(sf::Color(70, 70, 70));
+                window->draw(hoverBg);
+            }
+
+            sf::Text text(uiFont, item.label, getCalculatedFontSize());
+            text.setPosition({menuX + paddingX, currentY + 4.f});
+            text.setFillColor(item.enabled ? sf::Color::White : sf::Color(128, 128, 128));
+            window->draw(text);
+
+            currentY += itemHeight;
+        }
+    }
+
+    sf::FloatRect getThumbnailAreaRect() const {
+        auto windowSize = window->getSize();
+        float startX = 0.0f;
+        if (experimental) {
+            startX = static_cast<float>(parseSizeValue(mapWindowWidth, windowSize.x));
+        }
+        float width = std::max(0.0f, static_cast<float>(windowSize.x) - startX);
+        float height = static_cast<float>(windowSize.y);
+        return sf::FloatRect(sf::Vector2f(startX, 0.0f), sf::Vector2f(width, height));
+    }
+
+    bool isWithinCurrentWatchedFolder(const fs::path &dir) const {
+        if (currentWatchedFolder.empty()) {
+            return false;
+        }
+        try {
+            fs::path absDir = normalizePath(fs::absolute(dir));
+            fs::path absWatched = normalizePath(fs::absolute(currentWatchedFolder));
+            auto rel = fs::relative(absDir, absWatched);
+            std::string relStr = rel.string();
+            return !relStr.empty() && relStr.substr(0, 2) != "..";
+        } catch (...) {
+            return false;
+        }
+    }
+
+    bool folderHasDirectImages(const fs::path &dir) const {
+        try {
+            for (const auto &entry : fs::directory_iterator(dir)) {
+                if (entry.is_regular_file() && isSupportedImage(entry.path())) {
+                    return true;
+                }
+            }
+        } catch (...) {
+        }
+        return false;
+    }
+
+    fs::path findRepresentativeImageInTree(const fs::path &dir) {
+        std::vector<fs::path> directImages;
+        std::vector<fs::path> childFolders;
+
+        try {
+            for (const auto &entry : fs::directory_iterator(dir)) {
+                if (entry.is_regular_file() && isSupportedImage(entry.path())) {
+                    directImages.push_back(normalizePath(entry.path()));
+                } else if (entry.is_directory()) {
+                    childFolders.push_back(normalizePath(entry.path()));
+                }
+            }
+        } catch (...) {
+            return fs::path();
+        }
+
+        // If this folder has images, choose lexicographically first filename.
+        if (!directImages.empty()) {
+            std::ranges::sort(directImages, [](const fs::path &a, const fs::path &b) {
+                std::string nameA = a.filename().string();
+                std::string nameB = b.filename().string();
+                std::transform(nameA.begin(), nameA.end(), nameA.begin(), ::tolower);
+                std::transform(nameB.begin(), nameB.end(), nameB.begin(), ::tolower);
+                return nameA < nameB;
+            });
+            return directImages.front();
+        }
+
+        // No direct images: walk child folders in name order.
+        std::ranges::sort(childFolders, [](const fs::path &a, const fs::path &b) {
+            std::string nameA = a.filename().string();
+            std::string nameB = b.filename().string();
+            std::transform(nameA.begin(), nameA.end(), nameA.begin(), ::tolower);
+            std::transform(nameB.begin(), nameB.end(), nameB.begin(), ::tolower);
+            return nameA < nameB;
+        });
+
+        for (const auto &child : childFolders) {
+            fs::path rep = findRepresentativeImageInTree(child);
+            if (!rep.empty()) {
+                return rep;
+            }
+        }
+
+        return fs::path();
+    }
+
+    void rebuildFolderModeEntries() {
+        folderModeEntries.clear();
+        folderModeClickAreas.clear();
+
+        if (watchedFoldersMode) {
+            std::set<fs::path> roots;
+            for (const auto &folder : watchedFolders) {
+                if (folder.empty()) {
+                    continue;
+                }
+                fs::path normalized = normalizePath(fs::absolute(folder));
+                std::error_code ec;
+                if (fs::exists(normalized, ec) && fs::is_directory(normalized, ec)) {
+                    roots.insert(normalized);
+                }
+            }
+
+            for (const auto &root : roots) {
+                FolderModeEntry item;
+                item.folderPath = root;
+                item.representativeImage = findRepresentativeImageInTree(root);
+                item.label = pathToString(root);
+                folderModeEntries.push_back(item);
+            }
+
+            if (!pendingFolderModeFocusFolder.empty()) {
+                fs::path wanted = normalizePath(fs::absolute(pendingFolderModeFocusFolder));
+                size_t matched = std::numeric_limits<size_t>::max();
+                for (size_t i = 0; i < folderModeEntries.size(); i++) {
+                    if (normalizePath(fs::absolute(folderModeEntries[i].folderPath)) == wanted) {
+                        matched = i;
+                        break;
+                    }
+                }
+                folderModeFocusIndex = (matched == std::numeric_limits<size_t>::max()) ? 0 : matched;
+                pendingFolderModeFocusFolder.clear();
+            } else {
+                folderModeFocusIndex = 0;
+            }
+
+            thumbnailScrollRow = 0;
+            return;
+        }
+
+        if (currentFolder.empty()) {
+            return;
+        }
+
+        fs::path absCurrent = normalizePath(fs::absolute(currentFolder));
+        fs::path absWatched = normalizePath(fs::absolute(currentWatchedFolder));
+
+        FolderModeEntry parentEntry;
+        parentEntry.folderPath = (absCurrent == absWatched) ? absCurrent : absCurrent.parent_path();
+        parentEntry.label = "..";
+        parentEntry.isParentPlaceholder = true;
+        folderModeEntries.push_back(parentEntry);
+
+        std::vector<FolderModeEntry> entries;
+        try {
+            std::vector<fs::path> children;
+            for (const auto &entry : fs::directory_iterator(absCurrent)) {
+                if (entry.is_directory()) {
+                    children.push_back(normalizePath(entry.path()));
+                }
+            }
+            std::sort(children.begin(), children.end());
+
+            for (const auto &child : children) {
+                fs::path rep = findRepresentativeImageInTree(child);
+                if (rep.empty()) {
+                    continue;
+                }
+                FolderModeEntry item;
+                item.folderPath = child;
+                item.representativeImage = rep;
+                item.label = child.filename().string();
+                entries.push_back(item);
+            }
+        } catch (...) {
+        }
+
+        folderModeEntries.insert(folderModeEntries.end(), entries.begin(), entries.end());
+
+        if (!pendingFolderModeFocusFolder.empty()) {
+            fs::path wanted = normalizePath(fs::absolute(pendingFolderModeFocusFolder));
+            size_t matched = std::numeric_limits<size_t>::max();
+            for (size_t i = 0; i < folderModeEntries.size(); i++) {
+                if (normalizePath(fs::absolute(folderModeEntries[i].folderPath)) == wanted) {
+                    matched = i;
+                    break;
+                }
+            }
+            folderModeFocusIndex = (matched == std::numeric_limits<size_t>::max()) ? 0 : matched;
+            pendingFolderModeFocusFolder.clear();
+        } else {
+            folderModeFocusIndex = 0;
+        }
+
+        thumbnailScrollRow = 0;
+    }
+
+    void ensureFolderModeFocusVisible() {
+        if (!folderMode || folderModeEntries.empty()) {
+            return;
+        }
+        folderModeFocusIndex = std::min(folderModeFocusIndex, folderModeEntries.size() - 1);
+
+        ThumbnailLayout layout = computeThumbnailLayout();
+        if (layout.visibleRows <= 0) {
+            return;
+        }
+
+        int focusedRow = static_cast<int>(folderModeFocusIndex / static_cast<size_t>(thumbnailColumns));
+        if (focusedRow < thumbnailScrollRow) {
+            thumbnailScrollRow = focusedRow;
+        } else if (focusedRow >= thumbnailScrollRow + layout.visibleRows) {
+            thumbnailScrollRow = focusedRow - layout.visibleRows + 1;
+        }
+        thumbnailScrollRow = std::clamp(thumbnailScrollRow, 0, layout.maxScroll);
+    }
+
+    fs::path computeSeenImagesCommonFolder() const {
+        if (seenImageFolders.empty()) {
+            return currentFolder;
+        }
+
+        fs::path common = normalizePath(fs::absolute(seenImageFolders.front()));
+        for (size_t i = 1; i < seenImageFolders.size(); i++) {
+            fs::path other = normalizePath(fs::absolute(seenImageFolders[i]));
+            while (!common.empty() && common != other) {
+                try {
+                    auto rel = fs::relative(other, common);
+                    std::string relStr = rel.string();
+                    if (!relStr.empty() && relStr.substr(0, 2) != "..") {
+                        break;
+                    }
+                } catch (...) {
+                }
+                common = common.parent_path();
+            }
+        }
+        return common.empty() ? currentFolder : common;
+    }
+
+    void enterFolderMode(const fs::path &folder, const fs::path &focusFolder = fs::path()) {
+        watchedFoldersMode = false;
+        folderMode = true;
+        thumbnailMode = true;
+        thumbnailCollectionMessageActive = true;
+        currentFolder = normalizePath(fs::absolute(folder));
+        pendingFolderModeFocusFolder = focusFolder.empty() ? fs::path() : normalizePath(fs::absolute(focusFolder));
+        resetThumbnailLoadingState();
+        rebuildFolderModeEntries();
+        ensureFolderModeFocusVisible();
+    }
+
+    void enterWatchedFoldersMode(const fs::path &focusWatchedFolder = fs::path()) {
+        watchedFoldersMode = true;
+        folderMode = true;
+        thumbnailMode = true;
+        thumbnailCollectionMessageActive = true;
+        currentFolder.clear();
+        pendingFolderModeFocusFolder =
+            focusWatchedFolder.empty() ? fs::path() : normalizePath(fs::absolute(focusWatchedFolder));
+        resetThumbnailLoadingState();
+        rebuildFolderModeEntries();
+        ensureFolderModeFocusVisible();
+    }
+
+    void openFolderModeEntry(size_t entryIndex) {
+        if (entryIndex >= folderModeEntries.size()) {
+            return;
+        }
+
+        if (watchedFoldersMode) {
+            const FolderModeEntry &entry = folderModeEntries[entryIndex];
+            fs::path targetFolder = entry.folderPath;
+            if (targetFolder.empty()) {
+                return;
+            }
+
+            currentWatchedFolder = normalizePath(fs::absolute(targetFolder));
+            folderModeEligible = true;
+
+            if (folderHasDirectImages(targetFolder)) {
+                buildImageList(targetFolder);
+                watchedFoldersMode = false;
+                folderMode = false;
+                thumbnailMode = true;
+                currentIndex = 0;
+                for (size_t i = 0; i < allImagePaths.size(); i++) {
+                    if (passesActiveFilter(allImagePaths[i])) {
+                        currentIndex = i;
+                        break;
+                    }
+                }
+                onThumbnailSelectionChanged();
+                return;
+            }
+
+            enterFolderMode(targetFolder);
+            return;
+        }
+
+        fs::path previousFolder = normalizePath(fs::absolute(currentFolder));
+        const FolderModeEntry &entry = folderModeEntries[entryIndex];
+        fs::path targetFolder = entry.folderPath;
+
+        if (entry.isParentPlaceholder) {
+            if (!currentWatchedFolder.empty() && previousFolder == normalizePath(fs::absolute(currentWatchedFolder))) {
+                enterWatchedFoldersMode(previousFolder);
+                return;
+            }
+            if (targetFolder.empty() || !isWithinCurrentWatchedFolder(targetFolder)) {
+                return;
+            }
+            enterFolderMode(targetFolder, previousFolder);
+            return;
+        }
+
+        if (targetFolder.empty() || !isWithinCurrentWatchedFolder(targetFolder)) {
+            return;
+        }
+
+        if (folderHasDirectImages(targetFolder)) {
+            buildImageList(targetFolder);
+            folderMode = false;
+            thumbnailMode = true;
+            currentIndex = 0;
+            for (size_t i = 0; i < allImagePaths.size(); i++) {
+                if (passesActiveFilter(allImagePaths[i])) {
+                    currentIndex = i;
+                    break;
+                }
+            }
+            onThumbnailSelectionChanged();
+            return;
+        }
+
+        enterFolderMode(targetFolder);
+    }
+
+    bool ensureThumbnailCacheFile(const fs::path &imagePath, const fs::path &thumbCacheFile) {
+        if (fs::exists(thumbCacheFile)) {
+            return true;
+        }
+        return writeThumbnailCacheFile(imagePath, thumbCacheFile);
+    }
+
+    void invalidateThumbnailCache(const fs::path &imagePath) {
+        thumbnailTextureCache.erase(imagePath);
+
+        std::error_code ec;
+        const fs::path thumbCacheRoot = cacheLocation.empty() ? getDefaultCacheLocation() : fs::path(cacheLocation);
+        fs::remove(getThumbnailCacheFilePath(imagePath, thumbCacheRoot), ec);
+    }
+
+    std::shared_ptr<sf::Texture> getOrCreateThumbnailTexture(const fs::path &imagePath) {
+        if (imagePath.empty()) {
+            return nullptr;
+        }
+        auto it = thumbnailTextureCache.find(imagePath);
+        if (it != thumbnailTextureCache.end()) {
+            return it->second;
+        }
+
+        std::error_code ec;
+        const fs::path thumbCacheRoot = cacheLocation.empty() ? getDefaultCacheLocation() : fs::path(cacheLocation);
+        fs::path thumbCacheFile = getThumbnailCacheFilePath(imagePath, thumbCacheRoot);
+        fs::create_directories(thumbCacheFile.parent_path(), ec);
+
+        if (!ensureThumbnailCacheFile(imagePath, thumbCacheFile)) {
+            return nullptr;
+        }
+
+        auto tex = std::make_shared<sf::Texture>();
+        if (tex->loadFromFile(thumbCacheFile.string())) {
+            thumbnailTextureCache[imagePath] = tex;
+            return tex;
+        }
+        return nullptr;
+    }
+
+    struct ThumbnailLayout {
+        float padding = 0.0f;
+        float gap = 0.0f;
+        float scrollbarReserve = 0.0f;
+        float cellW = 0.0f;
+        float cellH = 0.0f;
+        int visibleRows = 1;
+        int totalRows = 0;
+        int maxScroll = 0;
+    };
+
+    ThumbnailLayout computeThumbnailLayout() const {
+        ThumbnailLayout layout;
+        layout.padding = 12.0f;
+        layout.gap = 14.0f;
+        layout.scrollbarReserve = 16.0f;
+
+        sf::FloatRect area = getThumbnailAreaRect();
+        float usableWidth = std::max(1.0f, area.size.x - layout.padding * 2.0f - layout.scrollbarReserve);
+        float usableHeight = std::max(1.0f, area.size.y - layout.padding * 2.0f);
+
+        float widthBound = (usableWidth - layout.gap * static_cast<float>(thumbnailColumns - 1)) /
+                           static_cast<float>(thumbnailColumns);
+        int targetRows = std::max(1, thumbnailColumns);
+        float heightBound = (usableHeight - layout.gap * static_cast<float>(targetRows - 1)) /
+                            (static_cast<float>(targetRows) * 0.75f);
+
+        layout.cellW = std::max(20.0f, std::min(widthBound, heightBound));
+        layout.cellH = layout.cellW * 0.75f;
+        layout.visibleRows = targetRows;
+        size_t visibleCount = folderMode ? folderModeEntries.size() : getVisibleThumbnailIndices().size();
+        layout.totalRows = static_cast<int>((visibleCount + static_cast<size_t>(thumbnailColumns) - 1) /
+                                            static_cast<size_t>(thumbnailColumns));
+        layout.maxScroll = std::max(0, layout.totalRows - layout.visibleRows);
+        return layout;
+    }
+
+    sf::FloatRect getThumbnailScrollbarTrackRect() const {
+        sf::FloatRect area = getThumbnailAreaRect();
+        ThumbnailLayout layout = computeThumbnailLayout();
+        if (layout.totalRows <= layout.visibleRows) {
+            return sf::FloatRect();
+        }
+
+        float barX = area.position.x + area.size.x - 8.0f;
+        float barY = area.position.y + layout.padding;
+        float barH = std::max(10.0f, area.size.y - layout.padding * 2.0f);
+        return sf::FloatRect(sf::Vector2f(barX, barY), sf::Vector2f(4.0f, barH));
+    }
+
+    sf::FloatRect getThumbnailScrollbarThumbRect() const {
+        ThumbnailLayout layout = computeThumbnailLayout();
+        sf::FloatRect track = getThumbnailScrollbarTrackRect();
+        if (track.size.x <= 0.0f || track.size.y <= 0.0f) {
+            return sf::FloatRect();
+        }
+
+        float thumbH = std::max(
+            20.0f, track.size.y * (static_cast<float>(layout.visibleRows) / static_cast<float>(layout.totalRows)));
+        float t = (layout.maxScroll > 0)
+                      ? (static_cast<float>(thumbnailScrollRow) / static_cast<float>(layout.maxScroll))
+                      : 0.0f;
+        float thumbY = track.position.y + t * (track.size.y - thumbH);
+        return sf::FloatRect(sf::Vector2f(track.position.x, thumbY), sf::Vector2f(track.size.x, thumbH));
+    }
+
+    void setThumbnailScrollFromCursorY(float cursorY) {
+        ThumbnailLayout layout = computeThumbnailLayout();
+        if (layout.maxScroll <= 0) {
+            thumbnailScrollRow = 0;
+            return;
+        }
+
+        sf::FloatRect track = getThumbnailScrollbarTrackRect();
+        sf::FloatRect thumb = getThumbnailScrollbarThumbRect();
+        if (track.size.y <= 0.0f || thumb.size.y <= 0.0f) {
+            return;
+        }
+
+        float newThumbY = std::clamp(cursorY - thumbnailScrollbarDragOffset, track.position.y,
+                                     track.position.y + track.size.y - thumb.size.y);
+        float t = (track.size.y - thumb.size.y) > 0.0f ? (newThumbY - track.position.y) / (track.size.y - thumb.size.y)
+                                                       : 0.0f;
+        thumbnailScrollRow = static_cast<int>(std::round(t * static_cast<float>(layout.maxScroll)));
+        thumbnailScrollRow = std::clamp(thumbnailScrollRow, 0, layout.maxScroll);
+    }
+
+    std::vector<size_t> getVisibleThumbnailIndices() const {
+        std::vector<size_t> visible;
+        visible.reserve(allImagePaths.size());
+
+        for (size_t i = 0; i < allImagePaths.size(); i++) {
+            if (passesActiveFilter(allImagePaths[i])) {
+                visible.push_back(i);
+            }
+        }
+
+        return visible;
+    }
+
+    void clampThumbnailScroll() {
+        if (!folderMode && allImagePaths.empty()) {
+            thumbnailScrollRow = 0;
+            return;
+        }
+
+        ThumbnailLayout layout = computeThumbnailLayout();
+        thumbnailScrollRow = std::clamp(thumbnailScrollRow, 0, layout.maxScroll);
+    }
+
+    void ensureThumbnailSelectionVisible() {
+        if (!thumbnailMode) {
+            return;
+        }
+        if (folderMode) {
+            clampThumbnailScroll();
+            return;
+        }
+        if (allImagePaths.empty()) {
+            return;
+        }
+
+        ThumbnailLayout layout = computeThumbnailLayout();
+        auto visibleIndices = getVisibleThumbnailIndices();
+        auto selectedIt = std::find(visibleIndices.begin(), visibleIndices.end(), currentIndex);
+        int selectedRow = 0;
+        if (selectedIt != visibleIndices.end()) {
+            size_t visibleIndex = static_cast<size_t>(std::distance(visibleIndices.begin(), selectedIt));
+            selectedRow = static_cast<int>(visibleIndex / static_cast<size_t>(thumbnailColumns));
+        }
+
+        if (selectedRow < thumbnailScrollRow) {
+            thumbnailScrollRow = selectedRow;
+        } else if (selectedRow >= thumbnailScrollRow + layout.visibleRows) {
+            thumbnailScrollRow = selectedRow - layout.visibleRows + 1;
+        }
+
+        clampThumbnailScroll();
+    }
+
+    void moveThumbnailPageDownOrNextFolder() {
+        if (!thumbnailMode || allImagePaths.empty() || currentIndex >= allImagePaths.size() ||
+            currentIndex >= allDirectories.size()) {
+            return;
+        }
+
+        auto visibleIndices = getVisibleThumbnailIndices();
+        if (visibleIndices.empty()) {
+            return;
+        }
+
+        const fs::path currentDir = allDirectories[currentIndex];
+        std::vector<size_t> folderVisibleIndices;
+        folderVisibleIndices.reserve(visibleIndices.size());
+        for (size_t idx : visibleIndices) {
+            if (idx < allDirectories.size() && allDirectories[idx] == currentDir) {
+                folderVisibleIndices.push_back(idx);
+            }
+        }
+
+        if (folderVisibleIndices.empty()) {
+            return;
+        }
+
+        ThumbnailLayout layout = computeThumbnailLayout();
+        size_t pageSize = std::max<size_t>(1, static_cast<size_t>(layout.visibleRows) *
+                                                  static_cast<size_t>(std::max(1, thumbnailColumns)));
+
+        auto it = std::find(folderVisibleIndices.begin(), folderVisibleIndices.end(), currentIndex);
+        size_t currentPos = (it != folderVisibleIndices.end())
+                                ? static_cast<size_t>(std::distance(folderVisibleIndices.begin(), it))
+                                : static_cast<size_t>(0);
+        size_t targetPos = currentPos + pageSize;
+
+        if (targetPos < folderVisibleIndices.size()) {
+            currentIndex = folderVisibleIndices[targetPos];
+        } else {
+            currentIndex = getFirstInNextFolder();
+        }
+
+        onThumbnailSelectionChanged();
+    }
+
+    void moveThumbnailPageUpOrPrevFolder() {
+        if (!thumbnailMode || allImagePaths.empty() || currentIndex >= allImagePaths.size() ||
+            currentIndex >= allDirectories.size()) {
+            return;
+        }
+
+        auto visibleIndices = getVisibleThumbnailIndices();
+        if (visibleIndices.empty()) {
+            return;
+        }
+
+        const fs::path currentDir = allDirectories[currentIndex];
+        std::vector<size_t> folderVisibleIndices;
+        folderVisibleIndices.reserve(visibleIndices.size());
+        for (size_t idx : visibleIndices) {
+            if (idx < allDirectories.size() && allDirectories[idx] == currentDir) {
+                folderVisibleIndices.push_back(idx);
+            }
+        }
+
+        if (folderVisibleIndices.empty()) {
+            return;
+        }
+
+        ThumbnailLayout layout = computeThumbnailLayout();
+        size_t pageSize = std::max<size_t>(1, static_cast<size_t>(layout.visibleRows) *
+                                                  static_cast<size_t>(std::max(1, thumbnailColumns)));
+
+        auto it = std::find(folderVisibleIndices.begin(), folderVisibleIndices.end(), currentIndex);
+        size_t currentPos = (it != folderVisibleIndices.end())
+                                ? static_cast<size_t>(std::distance(folderVisibleIndices.begin(), it))
+                                : static_cast<size_t>(0);
+
+        if (currentPos >= pageSize) {
+            currentIndex = folderVisibleIndices[currentPos - pageSize];
+        } else {
+            currentIndex = getFirstInPrevFolder();
+        }
+
+        onThumbnailSelectionChanged();
+    }
+
+    void setThumbnailColumns(int cols) {
+        thumbnailColumns = std::clamp(cols, 4, 12);
+        clampThumbnailScroll();
+        ensureThumbnailSelectionVisible();
+    }
+
+    void resetThumbnailLoadingState() {
+        thumbnailLoadQueue.clear();
+        thumbnailQueuedIndices.clear();
+        thumbnailReadyIndices.clear();
+        folderThumbnailLoadQueue.clear();
+        folderThumbnailQueuedIndices.clear();
+        folderThumbnailReadyIndices.clear();
+        folderThumbQueueSeeded = false;
+        thumbnailScrollbarDragging = false;
+    }
+
+    void enqueueFolderThumbnailLoad(size_t index, bool front = false) {
+        if (index >= folderModeEntries.size() || folderThumbnailReadyIndices.contains(index) ||
+            folderThumbnailQueuedIndices.contains(index)) {
+            return;
+        }
+
+        const auto &entry = folderModeEntries[index];
+        if (entry.isParentPlaceholder || entry.representativeImage.empty()) {
+            return;
+        }
+
+        folderThumbnailQueuedIndices.insert(index);
+        if (front) {
+            folderThumbnailLoadQueue.push_front(index);
+        } else {
+            folderThumbnailLoadQueue.push_back(index);
+        }
+    }
+
+    void enqueueVisibleFolderThumbnailLoads(int startRow, int endRow) {
+        if (folderModeEntries.empty()) {
+            return;
+        }
+
+        if (folderModeFocusIndex < folderModeEntries.size()) {
+            enqueueFolderThumbnailLoad(folderModeFocusIndex, true);
+        }
+
+        for (int row = startRow; row < endRow; row++) {
+            for (int col = 0; col < thumbnailColumns; col++) {
+                size_t idx =
+                    static_cast<size_t>(row) * static_cast<size_t>(thumbnailColumns) + static_cast<size_t>(col);
+                if (idx >= folderModeEntries.size()) {
+                    break;
+                }
+                enqueueFolderThumbnailLoad(idx);
+            }
+        }
+    }
+
+    void enqueueThumbnailLoad(size_t index, bool front = false) {
+        if (index >= allImagePaths.size() || thumbnailReadyIndices.contains(index) ||
+            thumbnailQueuedIndices.contains(index)) {
+            return;
+        }
+
+        thumbnailQueuedIndices.insert(index);
+        if (front) {
+            thumbnailLoadQueue.push_front(index);
+        } else {
+            thumbnailLoadQueue.push_back(index);
+        }
+    }
+
+    void enqueueVisibleThumbnailLoads(int startRow, int endRow) {
+        if (allImagePaths.empty()) {
+            return;
+        }
+
+        auto visibleIndices = getVisibleThumbnailIndices();
+        enqueueThumbnailLoad(currentIndex, true);
+
+        for (int row = startRow; row < endRow; row++) {
+            for (int col = 0; col < thumbnailColumns; col++) {
+                size_t visibleIndex =
+                    static_cast<size_t>(row) * static_cast<size_t>(thumbnailColumns) + static_cast<size_t>(col);
+                if (visibleIndex >= visibleIndices.size()) {
+                    break;
+                }
+                enqueueThumbnailLoad(visibleIndices[visibleIndex]);
+            }
+        }
+    }
+
+    void processThumbnailLoading() {
+        if (!thumbnailMode) {
+            return;
+        }
+
+        if (folderMode) {
+            if (!folderThumbnailLoadQueue.empty()) {
+                size_t idx = folderThumbnailLoadQueue.front();
+                folderThumbnailLoadQueue.pop_front();
+                folderThumbnailQueuedIndices.erase(idx);
+
+                if (idx < folderModeEntries.size()) {
+                    const auto &entry = folderModeEntries[idx];
+                    if (!entry.isParentPlaceholder && !entry.representativeImage.empty()) {
+                        ensureMetadataForImage(entry.representativeImage);
+                        if (getOrCreateThumbnailTexture(entry.representativeImage)) {
+                            folderThumbnailReadyIndices.insert(idx);
+                        }
+                    }
+                }
+            }
+
+            if (thumbnailCollectionMessageActive) {
+                bool allReady = true;
+                for (size_t i = 0; i < folderModeEntries.size(); i++) {
+                    const auto &entry = folderModeEntries[i];
+                    if (entry.isParentPlaceholder || entry.representativeImage.empty()) {
+                        continue;
+                    }
+                    if (!folderThumbnailReadyIndices.contains(i)) {
+                        allReady = false;
+                        break;
+                    }
+                }
+
+                if (allReady && folderThumbnailLoadQueue.empty() && folderThumbnailQueuedIndices.empty()) {
+                    thumbnailCollectionMessageActive = false;
+                }
+            }
+            return;
+        }
+
+        if (thumbnailLoadQueue.empty()) {
+            return;
+        }
+
+        size_t idx = thumbnailLoadQueue.front();
+        thumbnailLoadQueue.pop_front();
+        thumbnailQueuedIndices.erase(idx);
+
+        if (idx >= allImagePaths.size()) {
+            return;
+        }
+
+        const fs::path &imagePath = allImagePaths[idx];
+        if (getOrCreateThumbnailTexture(imagePath)) {
+            thumbnailReadyIndices.insert(idx);
+        }
+
+        if (thumbnailCollectionMessageActive && thumbnailMode && thumbnailLoadQueue.empty() &&
+            thumbnailQueuedIndices.empty()) {
+            auto visibleIndices = getVisibleThumbnailIndices();
+            ThumbnailLayout layout = computeThumbnailLayout();
+            int startRow = thumbnailScrollRow;
+            int endRow = std::min(layout.totalRows, startRow + layout.visibleRows);
+            bool visibleReady = true;
+
+            for (int row = startRow; row < endRow && visibleReady; row++) {
+                for (int col = 0; col < thumbnailColumns; col++) {
+                    size_t visibleIndex =
+                        static_cast<size_t>(row) * static_cast<size_t>(thumbnailColumns) + static_cast<size_t>(col);
+                    if (visibleIndex >= visibleIndices.size()) {
+                        break;
+                    }
+                    size_t imageIndex = visibleIndices[visibleIndex];
+                    if (!thumbnailReadyIndices.contains(imageIndex)) {
+                        visibleReady = false;
+                        break;
+                    }
+                }
+            }
+
+            if (visibleReady && thumbnailReadyIndices.contains(currentIndex)) {
+                thumbnailCollectionMessageActive = false;
+            }
+        }
+    }
+
+    void toggleThumbnailMode() {
+        thumbnailMode = !thumbnailMode;
+        folderMode = false;
+        closeContextMenu();
+        if (thumbnailMode) {
+            thumbnailCollectionMessageActive = true;
+            resetThumbnailLoadingState();
+            ensureThumbnailSelectionVisible();
+            thumbnailReadyIndices.erase(currentIndex);
+        } else if (!allImagePaths.empty()) {
+            thumbnailCollectionMessageActive = false;
+            loadImage(currentIndex);
+        } else {
+            thumbnailCollectionMessageActive = false;
+        }
+    }
+
+    void refreshThumbnailsAfterImageSetChange() {
+        if (!thumbnailMode) {
+            return;
+        }
+
+        resetThumbnailLoadingState();
+    }
+
+    std::shared_ptr<sf::Texture> getCachedThumbnailTexture(const fs::path &imagePath) {
+        auto it = thumbnailTextureCache.find(imagePath);
+        if (it == thumbnailTextureCache.end()) {
+            return nullptr;
+        }
+        return it->second;
+    }
+
+    sf::String fitTextToWidthWithEllipsis(const std::string &text, unsigned int charSize, float maxWidth) const {
+        if (text.empty() || maxWidth <= 0.0f) {
+            return sf::String();
+        }
+
+        sf::Text probe(uiFont, sf::String(), charSize);
+        sf::String full = sf::String::fromUtf8(text.begin(), text.end());
+        probe.setString(full);
+        if (probe.getLocalBounds().size.x <= maxWidth) {
+            return full;
+        }
+
+        const sf::String dots("...");
+        probe.setString(dots);
+        if (probe.getLocalBounds().size.x > maxWidth) {
+            return sf::String();
+        }
+
+        std::size_t lo = 0;
+        std::size_t hi = full.getSize();
+        while (lo < hi) {
+            std::size_t mid = (lo + hi + 1) / 2;
+            sf::String candidate = full.substring(0, mid) + dots;
+            probe.setString(candidate);
+            if (probe.getLocalBounds().size.x <= maxWidth) {
+                lo = mid;
+            } else {
+                hi = mid - 1;
+            }
+        }
+
+        if (lo == 0) {
+            return dots;
+        }
+        return full.substring(0, lo) + dots;
+    }
+
+    void drawThumbnailGrid() {
+        thumbnailClickAreas.clear();
+        folderModeClickAreas.clear();
+        if (!thumbnailMode) {
+            return;
+        }
+        if (!folderMode && allImagePaths.empty()) {
+            return;
+        }
+
+        sf::FloatRect area = getThumbnailAreaRect();
+        ThumbnailLayout layout = computeThumbnailLayout();
+        auto visibleIndices = folderMode ? std::vector<size_t>() : getVisibleThumbnailIndices();
+        thumbnailScrollRow = std::clamp(thumbnailScrollRow, 0, layout.maxScroll);
+
+        int startRow = thumbnailScrollRow;
+        int endRow = std::min(layout.totalRows, startRow + layout.visibleRows);
+
+        if (folderMode) {
+            enqueueVisibleFolderThumbnailLoads(startRow, endRow);
+
+            if (!folderThumbQueueSeeded) {
+                for (size_t i = 0; i < folderModeEntries.size(); i++) {
+                    enqueueFolderThumbnailLoad(i);
+                }
+                folderThumbQueueSeeded = true;
+            }
+        } else {
+            enqueueVisibleThumbnailLoads(startRow, endRow);
+        }
+
+        sf::RectangleShape areaBg(area.size);
+        areaBg.setPosition(area.position);
+        areaBg.setFillColor(sf::Color(12, 12, 12));
+        window->draw(areaBg);
+
+        for (int row = startRow; row < endRow; row++) {
+            for (int col = 0; col < thumbnailColumns; col++) {
+                size_t visibleIndex =
+                    static_cast<size_t>(row) * static_cast<size_t>(thumbnailColumns) + static_cast<size_t>(col);
+                size_t totalCount = folderMode ? folderModeEntries.size() : visibleIndices.size();
+                if (visibleIndex >= totalCount) {
+                    break;
+                }
+
+                size_t idx = folderMode ? visibleIndex : visibleIndices[visibleIndex];
+
+                float x = area.position.x + layout.padding + static_cast<float>(col) * (layout.cellW + layout.gap);
+                float y = area.position.y + layout.padding +
+                          static_cast<float>(row - startRow) * (layout.cellH + layout.gap);
+                sf::FloatRect cellRect(sf::Vector2f(x, y), sf::Vector2f(layout.cellW, layout.cellH));
+
+                float captionHeight =
+                    folderMode ? std::max(18.0f, static_cast<float>(getCalculatedFontSize() + 6)) : 0.0f;
+                sf::FloatRect imageRect =
+                    folderMode
+                        ? sf::FloatRect(sf::Vector2f(x, y),
+                                        sf::Vector2f(layout.cellW, std::max(10.0f, layout.cellH - captionHeight)))
+                        : cellRect;
+
+                sf::RectangleShape cellBg(cellRect.size);
+                cellBg.setPosition(cellRect.position);
+                cellBg.setFillColor(sf::Color(18, 18, 18));
+                cellBg.setOutlineThickness(1.0f);
+                cellBg.setOutlineColor(sf::Color(70, 70, 70));
+                window->draw(cellBg);
+
+                if (folderMode && folderModeEntries[idx].isParentPlaceholder) {
+                    sf::RectangleShape placeholder(imageRect.size);
+                    placeholder.setPosition(imageRect.position);
+                    placeholder.setFillColor(sf::Color::Transparent);
+                    placeholder.setOutlineThickness(2.0f);
+                    placeholder.setOutlineColor(sf::Color(140, 140, 140));
+                    window->draw(placeholder);
+                } else {
+                    std::shared_ptr<sf::Texture> tex;
+                    if (folderMode) {
+                        if (folderThumbnailReadyIndices.contains(idx)) {
+                            tex = getCachedThumbnailTexture(folderModeEntries[idx].representativeImage);
+                        }
+                    } else if (thumbnailReadyIndices.contains(idx)) {
+                        tex = getCachedThumbnailTexture(allImagePaths[idx]);
+                    }
+
+                    if (tex) {
+                        sf::Sprite thumb(*tex);
+                        auto texSize = tex->getSize();
+                        int orientation = 1;
+                        if (folderMode) {
+                            const fs::path &repImage = folderModeEntries[idx].representativeImage;
+                            orientation = getOrientationOrDefault(repImage);
+                        } else {
+                            orientation = getOrientationOrDefault(allImagePaths[idx]);
+                        }
+                        float thumbW = static_cast<float>(texSize.x);
+                        float thumbH = static_cast<float>(texSize.y);
+                        float rotation = 0.0f;
+                        bool flipH = false;
+                        bool flipV = false;
+
+                        switch (orientation) {
+                        case 2:
+                            flipH = true;
+                            break;
+                        case 3:
+                            rotation = 180.0f;
+                            break;
+                        case 4:
+                            flipV = true;
+                            break;
+                        case 5:
+                            rotation = 90.0f;
+                            flipH = true;
+                            break;
+                        case 6:
+                            rotation = 90.0f;
+                            break;
+                        case 7:
+                            rotation = 270.0f;
+                            flipH = true;
+                            break;
+                        case 8:
+                            rotation = 270.0f;
+                            break;
+                        default:
+                            break;
+                        }
+
+                        if (rotation == 90.0f || rotation == 270.0f) {
+                            std::swap(thumbW, thumbH);
+                        }
+
+                        float sx = imageRect.size.x / thumbW;
+                        float sy = imageRect.size.y / thumbH;
+                        float s = std::min(sx, sy);
+                        thumb.setRotation(sf::degrees(rotation));
+                        thumb.setScale({flipH ? -s : s, flipV ? -s : s});
+                        thumb.setOrigin({static_cast<float>(texSize.x) / 2.0f, static_cast<float>(texSize.y) / 2.0f});
+
+                        thumb.setPosition({imageRect.position.x + imageRect.size.x / 2.0f,
+                                           imageRect.position.y + imageRect.size.y / 2.0f});
+                        window->draw(thumb);
+                    }
+                }
+
+                if (!folderMode && idx == currentIndex) {
+                    sf::RectangleShape selected(cellRect.size);
+                    selected.setPosition(cellRect.position);
+                    selected.setFillColor(sf::Color::Transparent);
+                    selected.setOutlineThickness(3.0f);
+                    selected.setOutlineColor(sf::Color::Cyan);
+                    window->draw(selected);
+                } else if (folderMode && idx == folderModeFocusIndex) {
+                    sf::RectangleShape focused(cellRect.size);
+                    focused.setPosition(cellRect.position);
+                    focused.setFillColor(sf::Color::Transparent);
+                    focused.setOutlineThickness(3.0f);
+                    focused.setOutlineColor(sf::Color::Cyan);
+                    window->draw(focused);
+                }
+
+                if (folderMode) {
+                    const std::string caption = folderModeEntries[idx].label;
+                    if (!caption.empty()) {
+                        unsigned int captionSize = getCalculatedFontSize();
+                        float maxCaptionWidth = std::max(0.0f, imageRect.size.x - 8.0f);
+                        sf::String fittedCaption = fitTextToWidthWithEllipsis(caption, captionSize, maxCaptionWidth);
+                        if (fittedCaption.isEmpty()) {
+                            folderModeClickAreas.push_back({idx, cellRect});
+                            continue;
+                        }
+
+                        sf::Text captionText(uiFont, fittedCaption, captionSize);
+                        captionText.setFillColor(sf::Color::White);
+                        sf::FloatRect cb = captionText.getLocalBounds();
+                        float captionX = x + (layout.cellW - cb.size.x) / 2.0f - cb.position.x;
+                        float captionY =
+                            y + layout.cellH - captionHeight + (captionHeight - cb.size.y) / 2.0f - cb.position.y;
+                        captionText.setPosition({captionX, captionY});
+                        window->draw(captionText);
+                    }
+                    folderModeClickAreas.push_back({idx, cellRect});
+                } else {
+                    thumbnailClickAreas.push_back({idx, cellRect});
+                }
+            }
+        }
+
+        if (layout.totalRows > layout.visibleRows) {
+            sf::FloatRect track = getThumbnailScrollbarTrackRect();
+
+            sf::RectangleShape barBg(track.size);
+            barBg.setPosition(track.position);
+            barBg.setFillColor(sf::Color(40, 40, 40));
+            window->draw(barBg);
+
+            sf::FloatRect thumb = getThumbnailScrollbarThumbRect();
+            sf::RectangleShape barThumb(thumb.size);
+            barThumb.setPosition(thumb.position);
+            barThumb.setFillColor(sf::Color::Cyan);
+            window->draw(barThumb);
+        }
+    }
 
     void parseFilterExpression(Filter &filter) {
         // Extract pattern from expression like "Keywords % 'NOMINUS'"
@@ -616,6 +2202,14 @@ class MgVwr {
         return meta[key].get_ref<const std::string &>();
     }
 
+    std::optional<std::int64_t> getTakenEpoch(const fs::path &imagePath) const {
+        auto imageIt = imageMetadataCache.find(imagePath);
+        if (imageIt == imageMetadataCache.end()) {
+            return std::nullopt;
+        }
+        return datetime_utils::getTakenEpochFromMetadata(imageIt->second);
+    }
+
     bool hasKeywords(const fs::path &imagePath) const {
         auto imageIt = imageMetadataCache.find(imagePath);
         if (imageIt == imageMetadataCache.end()) {
@@ -632,7 +2226,9 @@ class MgVwr {
             return result;
         }
         const json &meta = imageIt->second;
-        // Schema guarantees Keywords is always an array of strings
+        if (!meta.contains("Keywords") || !meta["Keywords"].is_array()) {
+            return result;
+        }
         for (const auto &entry : meta["Keywords"]) {
             std::string trimmed = trimWhitespace(entry.get<std::string>());
             if (!trimmed.empty()) {
@@ -676,6 +2272,9 @@ class MgVwr {
             return 1;
         }
         const json &meta = imageIt->second;
+        if (!meta.contains("Orientation")) {
+            return 1;
+        }
         const auto &field = meta["Orientation"];
         if (field.is_number_integer()) {
             return field.get<int>();
@@ -734,24 +2333,6 @@ class MgVwr {
             }
         }
         return false;
-    }
-
-    // Initialize metadata entry with defaults from schema and complete: false
-    void initializeIncompleteMetadata(const fs::path &imagePath) {
-        json metaObject = json::object();
-        metaObject["SourceFile"] = imagePath.string();
-
-        // Enrich with schema defaults
-        try {
-            json enriched = enrichMetadataWithSchemaYaml(EXIFTOOL_RESPONSE_SCHEMA_YAML, metaObject);
-            imageMetadataCache[imagePath] = enriched;
-        } catch (const std::exception &e) {
-            // If enrichment fails, fall back to basic object
-            imageMetadataCache[imagePath] = metaObject;
-        }
-
-        // Mark as incomplete
-        imageMetadataCache[imagePath]["complete"] = false;
     }
 
     // Populate "filters" field in metadata for an image
@@ -887,10 +2468,13 @@ class MgVwr {
             // Font configuration
             fontSizeConfig = config["font"]["size"];
 
-            // Watched folders
+            // Watched folders: ordered array of {folder, auto_scan} objects; auto_scan defaults to false.
+            watchedFolderAutoScan.clear();
             watchedFolders.clear();
-            for (const auto &folder : config["watched_folders"]) {
-                fs::path folderPath = normalizePath(fs::path(folder.get<std::string>()));
+            for (const auto &entry : config["watched_folders"]) {
+                fs::path folderPath = normalizePath(fs::path(entry["folder"].get<std::string>()));
+                bool autoScan = entry.value("auto_scan", false);
+                watchedFolderAutoScan[folderPath] = autoScan;
                 watchedFolders.push_back(folderPath);
             }
 
@@ -1035,6 +2619,45 @@ class MgVwr {
     // Font size stays consistent regardless of windowed/fullscreen mode
     unsigned int getCalculatedFontSize() const { return parseSizeValue(fontSizeConfig, fullscreenWidth); }
 
+    fs::path resolveAppIconPath(const fs::path &exePath) const {
+        std::vector<fs::path> candidates;
+        candidates.push_back(fs::current_path() / "icons" / "MgVwr.ico");
+        candidates.push_back(fs::current_path().parent_path() / "icons" / "MgVwr.ico");
+
+        if (!exePath.empty()) {
+            fs::path exeDir = fs::absolute(exePath).parent_path();
+            candidates.push_back(exeDir / "icons" / "MgVwr.ico");
+            candidates.push_back(exeDir.parent_path() / "icons" / "MgVwr.ico");
+        }
+
+        for (const auto &candidate : candidates) {
+            std::error_code ec;
+            if (fs::exists(candidate, ec) && !ec) {
+                return candidate;
+            }
+        }
+
+        return fs::path();
+    }
+
+    void applyWindowIcon() {
+        if (!window || appIconPath.empty()) {
+            return;
+        }
+
+        if (!appIconLoadAttempted) {
+            appIconLoadAttempted = true;
+            appIconLoaded = appIconImage.loadFromFile(appIconPath.string());
+            if (!appIconLoaded) {
+                log_stdout("DEBUG", "Failed to load window icon: ", appIconPath.string());
+            }
+        }
+
+        if (appIconLoaded) {
+            window->setIcon(appIconImage);
+        }
+    }
+
     void createWindow(bool fullscreen) {
         isFullscreen = fullscreen;
         sf::VideoMode mode = fullscreen ? desktopMode : sf::VideoMode(windowedSize);
@@ -1044,6 +2667,7 @@ class MgVwr {
 
         window = std::make_shared<sf::RenderWindow>(mode, title, style, state);
         window->setFramerateLimit(60);
+        applyWindowIcon();
 
         // Restore window position if we have a stored state and we're in windowed mode
         if (!fullscreen && hasStoredWindowState) {
@@ -1105,7 +2729,6 @@ class MgVwr {
         }
 
         float scale;
-        float posX, posY;
 
         if (experimental) {
             // Experimental layout: reserve map width pixels on LEFT, no right space
@@ -1116,78 +2739,130 @@ class MgVwr {
             float scaleX = availableWidth / textureWidth;
             float scaleY = windowHeight / textureHeight;
             scale = std::min(scaleX, scaleY);
-
-            sprite->setScale({scale, scale});
-
-            // Calculate scaled dimensions
-            float scaledWidth = textureWidth * scale;
-            float scaledHeight = textureHeight * scale;
-
-            // Try to center image horizontally in full window
-            posX = (windowWidth - scaledWidth) / 2.0f + scaledWidth / 2.0f;
-            posY = (windowHeight - scaledHeight) / 2.0f + scaledHeight / 2.0f;
-
-            // If image overlaps with map area (left side), move it right
-            float leftEdgeX = posX - scaledWidth / 2.0f;
-            if (leftEdgeX < mapReserved) {
-                float shiftNeeded = mapReserved - leftEdgeX;
-                posX += shiftNeeded;
-            }
-
-            sprite->setPosition({posX, posY});
+            fitImageScale = scale;
         } else {
             // Original layout: center image in full window
             float scaleX = windowWidth / textureWidth;
             float scaleY = windowHeight / textureHeight;
             scale = std::min(scaleX, scaleY);
-
-            sprite->setScale({scale, scale});
-
-            float scaledWidth = textureWidth * scale;
-            float scaledHeight = textureHeight * scale;
-            posX = (windowWidth - scaledWidth) / 2.0f + scaledWidth / 2.0f;
-            posY = (windowHeight - scaledHeight) / 2.0f + scaledHeight / 2.0f;
-
-            sprite->setPosition({posX, posY});
+            fitImageScale = scale;
         }
+
+        applyScaleWithCanonicalPosition(scale);
     }
 
-    void ensureMetadataForImage(const fs::path &imagePath) {
-        // Check if metadata is already complete
-        auto imageIt = imageMetadataCache.find(imagePath);
-        if (imageIt != imageMetadataCache.end() && imageIt->second.contains("complete") &&
-            imageIt->second["complete"] == true) {
-            return; // Already complete
+    void applyScaleWithCanonicalPosition(float scale) {
+        if (!sprite || !texture) {
+            return;
         }
 
-        // Initialize with defaults if not exists
-        if (imageIt == imageMetadataCache.end()) {
-            initializeIncompleteMetadata(imagePath);
+        auto windowSize = window->getSize();
+        float windowWidth = static_cast<float>(windowSize.x);
+        float windowHeight = static_cast<float>(windowSize.y);
+
+        auto textureSize = texture->getSize();
+        float textureWidth = static_cast<float>(textureSize.x);
+        float textureHeight = static_cast<float>(textureSize.y);
+
+        // Account for rotation when calculating display size.
+        float rotation = sprite->getRotation().asDegrees();
+        if ((rotation >= 45.0f && rotation <= 135.0f) || (rotation >= 225.0f && rotation <= 315.0f)) {
+            std::swap(textureWidth, textureHeight);
         }
 
-        // Try exiftool first
-        if (exiftoolAvailable && !g_exiftoolPath.empty()) {
-            std::vector<fs::path> singleImage = {imagePath};
-            auto results = extractExiftoolData(singleImage);
-            if (results.find(imagePath) != results.end()) {
-                imageMetadataCache[imagePath] = results[imagePath];
-                imageMetadataCache[imagePath]["complete"] = true;
-                populateFilterResults(imagePath);
-                return;
+        sprite->setScale({scale, scale});
+
+        float scaledWidth = textureWidth * scale;
+        float scaledHeight = textureHeight * scale;
+        float posX = (windowWidth - scaledWidth) / 2.0f + scaledWidth / 2.0f;
+        float posY = (windowHeight - scaledHeight) / 2.0f + scaledHeight / 2.0f;
+
+        if (experimental) {
+            float mapReserved = static_cast<float>(parseSizeValue(mapWindowWidth, windowSize.x));
+            float leftEdgeX = posX - scaledWidth / 2.0f;
+            if (leftEdgeX < mapReserved) {
+                posX += (mapReserved - leftEdgeX);
             }
         }
 
-        // Fallback to manual parsing
-        std::vector<fs::path> singleImage = {imagePath};
-        auto results = extractImageMetadata(singleImage);
-        if (results.find(imagePath) != results.end()) {
-            imageMetadataCache[imagePath] = results[imagePath];
-            imageMetadataCache[imagePath]["complete"] = true;
-            populateFilterResults(imagePath);
+        sprite->setPosition({posX, posY});
+        currentImageScale = scale;
+    }
+
+    bool zoomImageAtCursor(const sf::Vector2f &cursorPos, float wheelDelta) {
+        if (!sprite || !texture || wheelDelta == 0.0f) {
+            return false;
         }
+
+        if (!sprite->getGlobalBounds().contains(cursorPos)) {
+            return false;
+        }
+
+        const float minScale = fitImageScale;
+        const float maxScale = std::max(minScale, 2.0f);
+        const float step = 1.10f;
+        const float oldScale = sprite->getScale().x;
+
+        float targetScale = oldScale;
+        if (wheelDelta > 0.0f) {
+            targetScale = oldScale * step;
+        } else if (wheelDelta < 0.0f) {
+            targetScale = oldScale / step;
+        }
+
+        targetScale = std::clamp(targetScale, minScale, maxScale);
+
+        // Consume wheel over image area even when already clamped at a limit.
+        if (targetScale == oldScale) {
+            jumpedToOldest = false;
+            if (wheelDelta > 0.0f && oldScale >= maxScale) {
+                navigationMessage = "Reached maximum zoom";
+            } else if (wheelDelta < 0.0f && oldScale <= minScale) {
+                navigationMessage = "Reached minimum zoom";
+            }
+            return true;
+        }
+
+        jumpedToOldest = false;
+        if (wheelDelta > 0.0f && targetScale >= maxScale) {
+            navigationMessage = "Reached maximum zoom";
+        } else if (wheelDelta < 0.0f && targetScale <= minScale) {
+            navigationMessage = "Reached minimum zoom";
+        } else {
+            navigationMessage.clear();
+        }
+
+        // Zoom-out should target canonical image placement, not cursor anchoring.
+        if (wheelDelta < 0.0f) {
+            applyScaleWithCanonicalPosition(targetScale);
+            return true;
+        }
+
+        // Keep the same image pixel under the cursor after scaling.
+        sf::Vector2f localPoint = sprite->getInverseTransform().transformPoint(cursorPos);
+        sprite->setScale({targetScale, targetScale});
+        sf::Vector2f after = sprite->getTransform().transformPoint(localPoint);
+        sprite->setPosition(sprite->getPosition() + (cursorPos - after));
+
+        currentImageScale = targetScale;
+        return true;
+    }
+
+    void ensureMetadataForImage(const fs::path &imagePath) {
+        metadata::ProviderOptions providerOptions;
+        providerOptions.cacheEnabled = metadataCacheReady;
+        providerOptions.cacheFilePath = metadataCacheFilePath;
+        providerOptions.exiftoolAvailable = exiftoolAvailable;
+        providerOptions.exiftoolPath = g_exiftoolPath;
+
+        metadata::ensureMetadataForImage(imagePath, imageMetadataCache, providerOptions,
+                                         [this](const fs::path &p) { invalidateThumbnailCache(p); });
+        populateFilterResults(imagePath);
     }
 
     void buildImageList(const fs::path &startDir) {
+        refreshThumbnailsAfterImageSetChange();
+
         allImagePaths.clear();
         allDirectories.clear();
         currentFolder = normalizePath(startDir);
@@ -1195,12 +2870,14 @@ class MgVwr {
         // Update current watched folder when changing directories
         fs::path newWatchedFolder = findWatchedFolder(currentFolder);
         if (!newWatchedFolder.empty()) {
+            folderModeEligible = true;
             if (newWatchedFolder != currentWatchedFolder) {
                 log_stdout("DEBUG", "buildImageList: Updating currentWatchedFolder from '",
                            currentWatchedFolder.string(), "' to '", newWatchedFolder.string(), "'");
             }
             currentWatchedFolder = newWatchedFolder;
         } else {
+            folderModeEligible = false;
             log_stdout("DEBUG", "buildImageList: Warning - no watched folder found for: ", currentFolder.string());
         }
 
@@ -1231,85 +2908,40 @@ class MgVwr {
             // Skip unreadable directories
         }
 
-        size_t imageFileCount = 0;
-        for (const auto &img : dirImages) {
-            std::string ext = img.extension().string();
-            std::transform(ext.begin(), ext.end(), ext.begin(), ::tolower);
-            for (const auto &suffix : supportedSuffixes) {
-                if (ext == suffix) {
-                    imageFileCount++;
-                    break;
-                }
-            }
-        }
+        metadata::ProviderOptions providerOptions;
+        providerOptions.cacheEnabled = metadataCacheReady;
+        providerOptions.cacheFilePath = metadataCacheFilePath;
+        providerOptions.exiftoolAvailable = exiftoolAvailable;
+        providerOptions.exiftoolPath = g_exiftoolPath;
 
-        bool tooManyImages = imageFileCount > 1000;
-        bool noExiftoolMany = (!exiftoolAvailable || g_exiftoolPath.empty()) && dirImages.size() > 20;
-        deferMetadataCurrentFolder = tooManyImages || noExiftoolMany;
-        sortByNameCurrentFolder = deferMetadataCurrentFolder;
+        metadata::fillMetadataForFolder(dirImages, imageMetadataCache, providerOptions, deferMetadataCurrentFolder,
+                                        sortByNameCurrentFolder,
+                                        [this](const fs::path &p) { invalidateThumbnailCache(p); });
 
-        // Initialize incomplete metadata for all images when deferred
-        if (deferMetadataCurrentFolder) {
-            for (const auto &imagePath : dirImages) {
-                initializeIncompleteMetadata(imagePath);
-            }
-        }
-
-        // Use exiftool in batch mode if available for all images at once
-        if (!deferMetadataCurrentFolder && exiftoolAvailable && !g_exiftoolPath.empty() && !dirImages.empty()) {
-            log_stdout("DEBUG", "Using exiftool batch mode for ", dirImages.size(), " images");
-
-            auto results = extractExiftoolData(dirImages);
-
-            for (const auto &[imagePath, metadata] : results) {
-                imageMetadataCache[imagePath] = metadata;
-                imageMetadataCache[imagePath]["complete"] = true;
-
-                const std::string &storedDateTime = getExifString(imagePath, "DateTimeOriginal");
-                const auto keywords = getKeywords(imagePath);
-                log_stdout("DEBUG", "Batch exiftool - ", imagePath.filename().string(), " DateTime: '", storedDateTime,
-                           "' Keywords: '", joinKeywords(keywords), "'");
-
-                // Populate filter results
-                populateFilterResults(imagePath);
-            }
-
-            log_stdout("DEBUG", "Batch exiftool parsed ", results.size(), " records");
-        }
-
-        // Fill in any missing metadata using manual parsing
-        if (!deferMetadataCurrentFolder) {
-            std::vector<fs::path> missing;
-            for (const auto &entry : dirImages) {
-                auto imageIt = imageMetadataCache.find(entry);
-                if (imageIt == imageMetadataCache.end() || !imageIt->second.contains("complete") ||
-                    imageIt->second["complete"] != true) {
-                    missing.push_back(entry);
-                }
-            }
-
-            if (!missing.empty()) {
-                log_stdout("DEBUG", "Using manual parsing for ", missing.size(), " images");
-                auto results = extractImageMetadata(missing);
-                for (const auto &entry : missing) {
-                    auto resultIt = results.find(entry);
-                    if (resultIt != results.end()) {
-                        imageMetadataCache[entry] = resultIt->second;
-                        imageMetadataCache[entry]["complete"] = true;
-                        populateFilterResults(entry);
-                    } else {
-                        initializeIncompleteMetadata(entry);
-                    }
-                }
-            }
+        for (const auto &imagePath : dirImages) {
+            populateFilterResults(imagePath);
         }
 
         // Sort images by shooting date/time if allowed, else/then by filename if datetimes are equal
-        std::ranges::sort(dirImages, std::less<>{}, [this](const fs::path &p) {
-            std::string name = p.filename().string();
-            std::transform(name.begin(), name.end(), name.begin(), ::tolower);
-            std::string date = sortByNameCurrentFolder ? std::string{} : getExifString(p, "DateTimeOriginal");
-            return std::tuple{date, name};
+        std::sort(dirImages.begin(), dirImages.end(), [this](const fs::path &a, const fs::path &b) {
+            std::string aName = a.filename().string();
+            std::string bName = b.filename().string();
+            std::transform(aName.begin(), aName.end(), aName.begin(), ::tolower);
+            std::transform(bName.begin(), bName.end(), bName.begin(), ::tolower);
+
+            if (sortByNameCurrentFolder) {
+                return aName < bName;
+            }
+
+            auto aTaken = getTakenEpoch(a);
+            auto bTaken = getTakenEpoch(b);
+            if (aTaken.has_value() != bTaken.has_value()) {
+                return aTaken.has_value();
+            }
+            if (aTaken.has_value() && bTaken.has_value() && *aTaken != *bTaken) {
+                return *aTaken < *bTaken;
+            }
+            return aName < bName;
         });
         // std::sort(dirImages.begin(), dirImages.end(),
         //     [this](const fs::path& a, const fs::path& b) {
@@ -1367,6 +2999,11 @@ class MgVwr {
         currentIndex = index;
         const auto &imagePath = allImagePaths[currentIndex];
 
+        fs::path shownFolder = normalizePath(imagePath.parent_path());
+        if (std::find(seenImageFolders.begin(), seenImageFolders.end(), shownFolder) == seenImageFolders.end()) {
+            seenImageFolders.push_back(shownFolder);
+        }
+
         ensureMetadataForImage(imagePath);
 
         texture = std::make_shared<sf::Texture>();
@@ -1423,71 +3060,11 @@ class MgVwr {
         float windowWidth = static_cast<float>(windowSize.x);
         float windowHeight = static_cast<float>(windowSize.y);
 
-        float scale;
-        float posX, posY;
-
-        if (experimental) {
-            // Experimental layout: reserve map width pixels on LEFT, no right space
-            float mapReserved = static_cast<float>(parseSizeValue(mapWindowWidth, windowSize.x));
-            float availableWidth = windowWidth - mapReserved;
-
-            log_stdout("DEBUG Experimental Layout: windowWidth=", windowWidth, ", mapReserved=", mapReserved,
-                       ", availableWidth=", availableWidth);
-
-            if (availableWidth < 0) {
-                throw std::runtime_error(
-                    "Horizontal pixels left for image < 0: available=" + std::to_string(availableWidth) +
-                    ", window=" + std::to_string(windowWidth) + ", mapReserved=" + std::to_string(mapReserved));
-            }
-
-            // Calculate scale based on available width and full window height
-            float scaleX = availableWidth / textureWidth;
-            float scaleY = windowHeight / textureHeight;
-            scale = std::min(scaleX, scaleY);
-
-            sprite->setScale({scale, scale});
-
-            // Set rotation origin to center for proper rotation
-            auto origSize = texture->getSize();
-            sprite->setOrigin({origSize.x / 2.0f, origSize.y / 2.0f});
-            sprite->setRotation(sf::degrees(rotation));
-
-            // Calculate scaled dimensions
-            float scaledWidth = textureWidth * scale;
-            float scaledHeight = textureHeight * scale;
-
-            // Try to center image horizontally in full window
-            posX = (windowWidth - scaledWidth) / 2.0f + scaledWidth / 2.0f;
-            posY = (windowHeight - scaledHeight) / 2.0f + scaledHeight / 2.0f;
-
-            // If image overlaps with map area (left side), move it right
-            float leftEdgeX = posX - scaledWidth / 2.0f;
-            if (leftEdgeX < mapReserved) {
-                float shiftNeeded = mapReserved - leftEdgeX;
-                posX += shiftNeeded;
-            }
-
-            sprite->setPosition({posX, posY});
-        } else {
-            // Original layout: center image in full window
-            float scaleX = windowWidth / textureWidth;
-            float scaleY = windowHeight / textureHeight;
-            scale = std::min(scaleX, scaleY);
-
-            sprite->setScale({scale, scale});
-
-            // Set rotation origin to center for proper rotation
-            auto origSize = texture->getSize();
-            sprite->setOrigin({origSize.x / 2.0f, origSize.y / 2.0f});
-            sprite->setRotation(sf::degrees(rotation));
-
-            float scaledWidth = textureWidth * scale;
-            float scaledHeight = textureHeight * scale;
-            posX = (windowWidth - scaledWidth) / 2.0f + scaledWidth / 2.0f;
-            posY = (windowHeight - scaledHeight) / 2.0f + scaledHeight / 2.0f;
-
-            sprite->setPosition({posX, posY});
-        }
+        // Set rotation origin to center for proper rotation and then apply fit layout.
+        auto origSize = texture->getSize();
+        sprite->setOrigin({origSize.x / 2.0f, origSize.y / 2.0f});
+        sprite->setRotation(sf::degrees(rotation));
+        updateSpritePositioning();
 
         // Format datetime output: skip time if 00:00:00, skip entirely if keywords start with the literal "+/-" string
         std::string dateTimeStr = getExifString(imagePath, "DateTimeOriginal");
@@ -1547,6 +3124,10 @@ class MgVwr {
                 }
             }
             mapViewer->setGPSPoints(folderGpsPoints);
+        }
+
+        if (thumbnailMode) {
+            ensureThumbnailSelectionVisible();
         }
     }
 
@@ -1830,49 +3411,9 @@ class MgVwr {
             return;
         }
 
-        size_t imageFileCount = 0;
-        for (const auto &img : dirImages) {
-            std::string ext = img.extension().string();
-            std::transform(ext.begin(), ext.end(), ext.begin(), ::tolower);
-            for (const auto &suffix : supportedSuffixes) {
-                if (ext == suffix) {
-                    imageFileCount++;
-                    break;
-                }
-            }
-        }
+        bool deferMetadata = false;
 
-        bool tooManyImages = imageFileCount > 1000;
-        bool noExiftoolMany = (!exiftoolAvailable || g_exiftoolPath.empty()) && dirImages.size() > 20;
-        bool deferMetadata = tooManyImages || noExiftoolMany;
-
-        // Use exiftool in batch mode if available for all images at once
         ImageMetadataCache imageMetadata;
-
-        // Helper to initialize incomplete metadata for deferred mode
-        auto initializeLocalIncomplete = [&imageMetadata](const fs::path &imagePath) {
-            json metaObject = json::object();
-            metaObject["SourceFile"] = imagePath.string();
-
-            // Enrich with schema defaults
-            try {
-                json enriched = enrichMetadataWithSchemaYaml(EXIFTOOL_RESPONSE_SCHEMA_YAML, metaObject);
-                imageMetadata[imagePath] = enriched;
-            } catch (const std::exception &e) {
-                // If enrichment fails, fall back to basic object
-                imageMetadata[imagePath] = metaObject;
-            }
-
-            // Mark as incomplete
-            imageMetadata[imagePath]["complete"] = false;
-        };
-
-        // Initialize incomplete metadata for all images when deferred
-        if (deferMetadata) {
-            for (const auto &imagePath : dirImages) {
-                initializeLocalIncomplete(imagePath);
-            }
-        }
 
         auto getLocalExif = [&imageMetadata](const fs::path &path, const std::string &key) -> const std::string & {
             static const std::string empty;
@@ -1894,7 +3435,9 @@ class MgVwr {
                 return result;
             }
             const json &meta = imageIt->second;
-            // Schema guarantees Keywords is always an array of strings
+            if (!meta.contains("Keywords") || !meta["Keywords"].is_array()) {
+                return result;
+            }
             for (const auto &entry : meta["Keywords"]) {
                 std::string trimmed = trimWhitespace(entry.get<std::string>());
                 if (!trimmed.empty()) {
@@ -1922,45 +3465,18 @@ class MgVwr {
             meta["filters"] = filterResults;
         };
 
-        if (!deferMetadata && exiftoolAvailable && !g_exiftoolPath.empty() && !dirImages.empty()) {
-            log_stdout("DEBUG", "Pre-caching: using exiftool batch mode for ", dirImages.size(), " images");
+        bool sortByName = false;
+        metadata::ProviderOptions providerOptions;
+        providerOptions.cacheEnabled = metadataCacheReady;
+        providerOptions.cacheFilePath = metadataCacheFilePath;
+        providerOptions.exiftoolAvailable = exiftoolAvailable;
+        providerOptions.exiftoolPath = g_exiftoolPath;
 
-            auto results = extractExiftoolData(dirImages);
+        metadata::fillMetadataForFolder(dirImages, imageMetadata, providerOptions, deferMetadata, sortByName,
+                                        [this](const fs::path &p) { invalidateThumbnailCache(p); });
 
-            for (const auto &[imagePath, metadata] : results) {
-                imageMetadata[imagePath] = metadata;
-                imageMetadata[imagePath]["complete"] = true;
-                // Populate filter results
-                populateLocalFilterResults(imagePath);
-            }
-
-            log_stdout("DEBUG", "Pre-caching: extracted metadata for ", results.size(), " images");
-        }
-
-        // Fill in any missing metadata using manual parsing
-        if (!deferMetadata) {
-            std::vector<fs::path> missing;
-            for (const auto &entry : dirImages) {
-                auto imageIt = imageMetadata.find(entry);
-                if (imageIt == imageMetadata.end() || !imageIt->second.contains("complete") ||
-                    imageIt->second["complete"] != true) {
-                    missing.push_back(entry);
-                }
-            }
-
-            if (!missing.empty()) {
-                auto results = extractImageMetadata(missing);
-                for (const auto &entry : missing) {
-                    auto resultIt = results.find(entry);
-                    if (resultIt != results.end()) {
-                        imageMetadata[entry] = resultIt->second;
-                        imageMetadata[entry]["complete"] = true;
-                        populateLocalFilterResults(entry);
-                    } else {
-                        initializeLocalIncomplete(entry);
-                    }
-                }
-            }
+        for (const auto &imagePath : dirImages) {
+            populateLocalFilterResults(imagePath);
         }
 
         if (deferMetadata) {
@@ -1974,7 +3490,29 @@ class MgVwr {
         } else {
             // Sort images by shooting date/time
             std::sort(dirImages.begin(), dirImages.end(), [&getLocalExif](const fs::path &a, const fs::path &b) {
-                return getLocalExif(a, "DateTimeOriginal") < getLocalExif(b, "DateTimeOriginal");
+                std::string aName = a.filename().string();
+                std::string bName = b.filename().string();
+                std::transform(aName.begin(), aName.end(), aName.begin(), ::tolower);
+                std::transform(bName.begin(), bName.end(), bName.begin(), ::tolower);
+
+                auto takenEpoch = [&](const fs::path &path) -> std::optional<std::int64_t> {
+                    std::string dateTimeOriginal = getLocalExif(path, "DateTimeOriginal");
+                    std::string offsetTimeOriginal = getLocalExif(path, "OffsetTimeOriginal");
+                    if (offsetTimeOriginal.empty()) {
+                        offsetTimeOriginal = "+00:00";
+                    }
+                    return datetime_utils::exifTakenEpoch(dateTimeOriginal, offsetTimeOriginal);
+                };
+
+                auto aTaken = takenEpoch(a);
+                auto bTaken = takenEpoch(b);
+                if (aTaken.has_value() != bTaken.has_value()) {
+                    return aTaken.has_value();
+                }
+                if (aTaken.has_value() && bTaken.has_value() && *aTaken != *bTaken) {
+                    return *aTaken < *bTaken;
+                }
+                return aName < bName;
             });
         }
 
@@ -2099,7 +3637,7 @@ class MgVwr {
         fs::path prevFolder = getPrevFolder();
         while (!prevFolder.empty()) {
             std::string navigationType = classifyNavigation(currentFolder, prevFolder, pathClassifications);
-            navigationMessage = "Jumped to of prev " + navigationType + " (last of folder)";
+            navigationMessage = "Jumped to prev " + navigationType + " (last of folder)";
             log_stdout(navigationMessage, ": ", prevFolder.string());
             buildImageList(prevFolder);
             if (!allImagePaths.empty()) {
@@ -2137,7 +3675,7 @@ class MgVwr {
         fs::path prevFolder = getPrevFolder();
         while (!prevFolder.empty()) {
             std::string navigationType = classifyNavigation(currentFolder, prevFolder, pathClassifications);
-            navigationMessage = "Jumped to of prev " + navigationType + " (1st of folder)";
+            navigationMessage = "Jumped to prev " + navigationType + " (1st of folder)";
             log_stdout(navigationMessage, ": ", prevFolder.string());
             buildImageList(prevFolder);
             if (!allImagePaths.empty()) {
@@ -2277,6 +3815,7 @@ class MgVwr {
         windowedPosition = sf::Vector2i((desktopMode.size.x - winWidth) / 2, (desktopMode.size.y - winHeight) / 2);
 
         windowTitle = exePath.empty() ? "mgvwr.exe" : fs::path(exePath).filename().string();
+        appIconPath = resolveAppIconPath(exePath);
 
         // Start in windowed or fullscreen mode based on config
         bool startFullscreen = !windowModeIsDefault;
@@ -2318,8 +3857,9 @@ class MgVwr {
         loadUIFont();
 
         // Check if exiftool is available
-        auto [found, path] = findExiftool();
-        g_exiftoolPath = path;
+        std::string resolvedExiftoolPath;
+        bool found = metadata::findExiftool(resolvedExiftoolPath);
+        g_exiftoolPath = resolvedExiftoolPath;
         exiftoolAvailable = found && !g_exiftoolPath.empty();
 
         // Initialize map viewer with cache configuration
@@ -2328,6 +3868,18 @@ class MgVwr {
             if (cacheLocation.empty()) {
                 cacheLocation = getDefaultCacheLocation().string();
             }
+
+            std::string metadataCacheError;
+            fs::path metadataCacheFile = metadata_cache::defaultMetadataCacheFile(fs::path(cacheLocation));
+            if (metadata_cache::initializeMetadataCache(metadataCacheFile, metadataCacheError)) {
+                metadataCacheReady = true;
+                metadataCacheFilePath = metadataCacheFile;
+                log_stdout("Metadata cache initialized at: ", pathToString(metadataCacheFile.make_preferred()));
+            } else {
+                metadataCacheReady = false;
+                log_stderr("Metadata cache initialization failed: ", metadataCacheError);
+            }
+
             // Append "osm" subdirectory
             fs::path osmCachePath = fs::path(cacheLocation) / "osm";
             std::string osmCacheDir = osmCachePath.string();
@@ -2343,6 +3895,14 @@ class MgVwr {
 
         // Load help content after filters are loaded
         helpLines = loadHelpContent(config);
+
+        if (imagePath.empty()) {
+            if (watchedFolders.empty()) {
+                throw std::runtime_error("No watched folders configured");
+            }
+            enterWatchedFoldersMode();
+            return;
+        }
 
         // Validate input and normalize paths to uppercase drive letters
         fs::path absPath = fs::absolute(imagePath);
@@ -2378,29 +3938,15 @@ class MgVwr {
             throw std::runtime_error("No supported images found in folder");
         }
 
-        // Find oldest image in the current directory
-        fs::path argFileDir = absPath.parent_path();
-        size_t oldestIndex = 0;
-        std::string oldestDateTime = "9999:99:99 99:99:99";
-        bool foundOldest = false;
-
+        currentIndex = 0;
         for (size_t i = 0; i < allImagePaths.size(); i++) {
-            if (allDirectories[i] == argFileDir) {
-                const std::string &dateTime = getExifString(allImagePaths[i], "DateTimeOriginal");
-                if (dateTime < oldestDateTime) {
-                    oldestDateTime = dateTime;
-                    oldestIndex = i;
-                    foundOldest = true;
-                }
+            if (allImagePaths[i] == absPath) {
+                currentIndex = i;
+                break;
             }
         }
 
-        currentIndex = oldestIndex;
-        jumpedToOldest = (allImagePaths[currentIndex] != absPath) && foundOldest;
-
-        if (jumpedToOldest) {
-            log_stdout("Jumped to oldest image: ", allImagePaths[currentIndex].filename());
-        }
+        jumpedToOldest = false;
 
         // Load initial image
         loadImage(currentIndex);
@@ -2419,10 +3965,24 @@ class MgVwr {
                 if (experimental && mapViewer && mapViewer->isOpen()) {
                     const sf::Texture *mapTexture = mapViewer->getTexture();
                     if (mapTexture) {
+                        if (!currentMapSubjectHasGps()) {
+                            mapTexture = nullptr;
+                        }
+                        bool skipMapForwarding = contextMenuVisible;
+                        if (const auto *mouseButtonEvent = event->getIf<sf::Event::MouseButtonPressed>()) {
+                            skipMapForwarding =
+                                skipMapForwarding || (mouseButtonEvent->button == sf::Mouse::Button::Right);
+                        }
+                        if (skipMapForwarding) {
+                            // Context menu interaction (and right click opening it) should not be swallowed by map.
+                            mapTexture = nullptr;
+                        }
+                    }
+                    if (mapTexture) {
                         auto windowSize = window->getSize();
                         auto mapSize = mapTexture->getSize();
                         float mapX = 0.f;
-                        float mapY = (windowSize.y - mapSize.y) / 2.0f;
+                        float mapY = getInlineMapY(windowSize.y, mapSize.y);
 
                         // Extract mouse position from event (default to off-screen if not a mouse event)
                         sf::Vector2i mousePos(-1000, -1000); // Default off-screen
@@ -2440,6 +4000,16 @@ class MgVwr {
                         // Check if mouse is over map area (only for actual mouse events)
                         if (mousePos.x >= mapX && mousePos.x < mapX + mapSize.x && mousePos.y >= mapY &&
                             mousePos.y < mapY + mapSize.y) {
+                            if (const auto *mouseButtonEvent = event->getIf<sf::Event::MouseButtonPressed>()) {
+                                if (mouseButtonEvent->button == sf::Mouse::Button::Left) {
+                                    if (selectImageFromInlineMapDotsNear(sf::Vector2f(
+                                            static_cast<float>(mousePos.x), static_cast<float>(mousePos.y)))) {
+                                        eventHandledByMap = true;
+                                        continue;
+                                    }
+                                }
+                            }
+
                             // Forward to map viewer with offset
                             mapViewer->handleEvent(*event,
                                                    sf::Vector2i(static_cast<int>(mapX), static_cast<int>(mapY)));
@@ -2456,10 +4026,94 @@ class MgVwr {
                 if (event->is<sf::Event::Closed>()) {
                     window->close();
                 } else if (const auto *keyEvent = event->getIf<sf::Event::KeyPressed>()) {
+                    if (contextMenuVisible && keyEvent->code == sf::Keyboard::Key::Escape) {
+                        closeContextMenu();
+                        continue;
+                    }
                     handleKeyPress(*keyEvent);
                 } else if (const auto *mouseEvent = event->getIf<sf::Event::MouseButtonPressed>()) {
+                    sf::Vector2f clickPos(mouseEvent->position.x, mouseEvent->position.y);
+
+                    if (mouseEvent->button == sf::Mouse::Button::Right) {
+                        openContextMenu(clickPos);
+                        continue;
+                    }
+
+                    if (contextMenuVisible) {
+                        if (mouseEvent->button == sf::Mouse::Button::Left) {
+                            handleContextMenuClick(clickPos);
+                        } else {
+                            closeContextMenu();
+                        }
+                        continue;
+                    }
+
                     if (mouseEvent->button == sf::Mouse::Button::Left) {
-                        sf::Vector2f clickPos(mouseEvent->position.x, mouseEvent->position.y);
+                        if (thumbnailMode) {
+                            sf::FloatRect thumbRect = getThumbnailScrollbarThumbRect();
+                            sf::FloatRect trackRect = getThumbnailScrollbarTrackRect();
+                            if (trackRect.contains(clickPos) && trackRect.size.x > 0.0f && trackRect.size.y > 0.0f) {
+                                if (thumbRect.contains(clickPos)) {
+                                    thumbnailScrollbarDragging = true;
+                                    thumbnailScrollbarDragOffset = clickPos.y - thumbRect.position.y;
+                                } else {
+                                    thumbnailScrollbarDragOffset = thumbRect.size.y * 0.5f;
+                                    setThumbnailScrollFromCursorY(clickPos.y);
+                                    thumbnailScrollbarDragging = true;
+                                }
+                                continue;
+                            }
+
+                            if (folderMode) {
+                                bool folderHit = false;
+                                for (const auto &[entryIdx, rect] : folderModeClickAreas) {
+                                    if (rect.contains(clickPos)) {
+                                        folderHit = true;
+                                        folderModeFocusIndex = entryIdx;
+                                        auto now = std::chrono::steady_clock::now();
+                                        auto elapsed = now - lastFolderModeClickTime;
+                                        refreshMapForFolderFocusSelection();
+                                        if (lastFolderModeClickedIndex == entryIdx &&
+                                            elapsed <= std::chrono::milliseconds(350)) {
+                                            openFolderModeEntry(entryIdx);
+                                        }
+                                        lastFolderModeClickedIndex = entryIdx;
+                                        lastFolderModeClickTime = now;
+                                        break;
+                                    }
+                                }
+                                if (!folderHit) {
+                                    closeContextMenu();
+                                }
+                                continue;
+                            }
+
+                            bool thumbHit = false;
+                            for (const auto &[thumbIdx, rect] : thumbnailClickAreas) {
+                                if (rect.contains(clickPos)) {
+                                    thumbHit = true;
+                                    currentIndex = thumbIdx;
+                                    onThumbnailSelectionChanged();
+
+                                    auto now = std::chrono::steady_clock::now();
+                                    auto elapsed = now - lastThumbnailClickTime;
+                                    if (lastThumbnailClickedIndex == thumbIdx &&
+                                        elapsed <= std::chrono::milliseconds(350)) {
+                                        thumbnailMode = false;
+                                        loadImage(currentIndex);
+                                    }
+                                    lastThumbnailClickedIndex = thumbIdx;
+                                    lastThumbnailClickTime = now;
+                                    break;
+                                }
+                            }
+
+                            if (!thumbHit) {
+                                closeContextMenu();
+                            }
+                            continue;
+                        }
+
                         bool clickHandled = false;
 
                         // Check if click is on any navigation arrow
@@ -2493,18 +4147,7 @@ class MgVwr {
                                         if (hasGpsLatitude(imagePath)) {
                                             double lat = getGpsValueOrZero(imagePath, "GPSLatitude");
                                             double lon = getGpsValueOrZero(imagePath, "GPSLongitude");
-                                            if (mapIdx == -1) {
-                                                // Toggle map visibility
-                                                if (mapViewer) {
-                                                    if (mapViewer->isOpen()) {
-                                                        mapViewer->close();
-                                                        log_stdout("Closing map");
-                                                    } else {
-                                                        mapViewer->showMap(lat, lon, defaultZoom);
-                                                        log_stdout("Opening map for ", lat, ", ", lon);
-                                                    }
-                                                }
-                                            } else if (mapIdx >= 0 && mapIdx < static_cast<int>(maps.size())) {
+                                            if (mapIdx >= 0 && mapIdx < static_cast<int>(maps.size())) {
                                                 const Map &m = maps[mapIdx];
                                                 std::string url = buildMapURL(m.gui_url_template, lat, lon, m.zoom);
                                                 openURL(url);
@@ -2541,8 +4184,8 @@ class MgVwr {
                         if (mapTexture) {
                             auto windowSize = window->getSize();
                             auto mapSize = mapTexture->getSize();
-                            float mapX = windowSize.x - mapSize.x;
-                            float mapY = (windowSize.y - mapSize.y) / 2.0f;
+                            float mapX = 0.f;
+                            float mapY = getInlineMapY(windowSize.y, mapSize.y);
 
                             // Check if mouse is over map area - if it is, don't process wheel for images
                             sf::Vector2i mousePos = wheelEvent->position;
@@ -2554,6 +4197,33 @@ class MgVwr {
                     }
 
                     if (shouldProcessWheel) {
+                        sf::Vector2f wheelPos(static_cast<float>(wheelEvent->position.x),
+                                              static_cast<float>(wheelEvent->position.y));
+                        bool overThumbnailArea = thumbnailMode && getThumbnailAreaRect().contains(wheelPos);
+
+                        bool ctrlHeld = sf::Keyboard::isKeyPressed(sf::Keyboard::Key::LControl) ||
+                                        sf::Keyboard::isKeyPressed(sf::Keyboard::Key::RControl);
+
+                        if (thumbnailMode && ctrlHeld && overThumbnailArea) {
+                            int deltaColumns = (wheelEvent->delta > 0.0f) ? -1 : (wheelEvent->delta < 0.0f ? 1 : 0);
+                            if (deltaColumns != 0) {
+                                setThumbnailColumns(thumbnailColumns + deltaColumns);
+                            }
+                            continue;
+                        }
+
+                        if (thumbnailMode && !ctrlHeld && overThumbnailArea) {
+                            thumbnailScrollRow += (wheelEvent->delta > 0.0f) ? -1 : (wheelEvent->delta < 0.0f ? 1 : 0);
+                            clampThumbnailScroll();
+                            continue;
+                        }
+
+                        if (ctrlHeld) {
+                            if (zoomImageAtCursor(wheelPos, wheelEvent->delta)) {
+                                continue;
+                            }
+                        }
+
                         bool shiftHeld = sf::Keyboard::isKeyPressed(sf::Keyboard::Key::LShift) ||
                                          sf::Keyboard::isKeyPressed(sf::Keyboard::Key::RShift);
 
@@ -2577,6 +4247,15 @@ class MgVwr {
                             }
                         }
                     }
+                } else if (const auto *mouseMoveEvent = event->getIf<sf::Event::MouseMoved>()) {
+                    if (thumbnailMode && thumbnailScrollbarDragging) {
+                        setThumbnailScrollFromCursorY(static_cast<float>(mouseMoveEvent->position.y));
+                        continue;
+                    }
+                } else if (const auto *mouseReleaseEvent = event->getIf<sf::Event::MouseButtonReleased>()) {
+                    if (thumbnailMode && mouseReleaseEvent->button == sf::Mouse::Button::Left) {
+                        thumbnailScrollbarDragging = false;
+                    }
                 } else if (const auto *resizeEvent = event->getIf<sf::Event::Resized>()) {
                     // Reset the view to match the new window size to prevent distortion
                     window->setView(sf::View(sf::FloatRect({0.f, 0.f}, sf::Vector2f(resizeEvent->size))));
@@ -2598,6 +4277,9 @@ class MgVwr {
                     if (!allImagePaths.empty() && sprite && texture) {
                         updateSpritePositioning();
                     }
+                    if (thumbnailMode) {
+                        ensureThumbnailSelectionVisible();
+                    }
                 }
             }
 
@@ -2613,6 +4295,30 @@ class MgVwr {
                     break;
                 }
             }
+            if (!mouseOverLink && thumbnailMode) {
+                if (folderMode) {
+                    for (const auto &[entryIdx, clickArea] : folderModeClickAreas) {
+                        if (clickArea.contains(mousePos)) {
+                            mouseOverLink = true;
+                            break;
+                        }
+                    }
+                } else {
+                    for (const auto &[thumbIdx, clickArea] : thumbnailClickAreas) {
+                        if (clickArea.contains(mousePos)) {
+                            mouseOverLink = true;
+                            break;
+                        }
+                    }
+                }
+
+                if (!mouseOverLink) {
+                    sf::FloatRect scrollTrack = getThumbnailScrollbarTrackRect();
+                    if (scrollTrack.size.x > 0.0f && scrollTrack.size.y > 0.0f && scrollTrack.contains(mousePos)) {
+                        mouseOverLink = true;
+                    }
+                }
+            }
             // Also check navigation arrows
             if (!mouseOverLink) {
                 for (const auto &[arrow, clickArea] : navArrowAreas) {
@@ -2621,6 +4327,10 @@ class MgVwr {
                         break;
                     }
                 }
+            }
+
+            if (!mouseOverLink && mapViewer && mapViewer->isOpen()) {
+                mouseOverLink = isMouseOverInlineMapDot(mousePos);
             }
 
             if (quietMode) {
@@ -2649,8 +4359,11 @@ class MgVwr {
 
             // Render
             window->clear(sf::Color::Black);
-            if (sprite) {
+            if (!thumbnailMode && sprite) {
                 window->draw(*sprite);
+            }
+            if (thumbnailMode) {
+                drawThumbnailGrid();
             }
 
             // Draw inline map if experimental mode and map is shown
@@ -2660,21 +4373,44 @@ class MgVwr {
                     sf::Sprite mapSprite(*mapTexture);
                     auto windowSize = window->getSize();
                     auto mapSize = mapTexture->getSize();
-                    // Position on left side, vertically centered
+                    // Position on left side, anchored to bottom
                     float mapX = 0.f;
-                    float mapY = (windowSize.y - mapSize.y) / 2.0f;
+                    float mapY = getInlineMapY(windowSize.y, mapSize.y);
                     mapSprite.setPosition(sf::Vector2f(mapX, mapY));
                     window->draw(mapSprite);
+
+                    if (!currentMapSubjectHasGps()) {
+                        sf::RectangleShape overlay(
+                            sf::Vector2f(static_cast<float>(mapSize.x), static_cast<float>(mapSize.y)));
+                        overlay.setPosition(sf::Vector2f(mapX, mapY));
+                        overlay.setFillColor(sf::Color::Black);
+                        window->draw(overlay);
+
+                        if (uiFontLoaded) {
+                            const std::string noMapText = "No map for this image (no GPS coordinates)";
+                            sf::Text text(uiFont, noMapText, getCalculatedFontSize());
+                            text.setFillColor(sf::Color::Red);
+                            sf::FloatRect bounds = text.getLocalBounds();
+                            float textX = mapX + std::max(8.f, (static_cast<float>(mapSize.x) - bounds.size.x) * 0.5f);
+                            float textY = mapY + (static_cast<float>(mapSize.y) - bounds.size.y) * 0.5f;
+                            text.setPosition(sf::Vector2f(textX, textY));
+                            window->draw(text);
+                        }
+                    }
                 }
             }
+
+            mapTileDownloadMessageActive =
+                mapViewer && mapViewer->isOpen() && currentMapSubjectHasGps() && mapViewer->isLoadingTiles();
 
             if (!quietMode) {
                 drawTopLeftInfo();
                 drawFilterInfo();
                 drawMapInfo();
 
-                // Draw navigation message if available
-                if (!navigationMessage.empty()) {
+                // Draw navigation message row (including transient status text)
+                if (!navigationMessage.empty() || thumbnailCollectionMessageActive ||
+                    metadataCollectionMessageActive || mapTileDownloadMessageActive) {
                     drawNavigationMessage();
                 }
                 // Otherwise draw "Jumped to oldest" message if applicable
@@ -2688,7 +4424,11 @@ class MgVwr {
                 drawHelp(window, helpLines, uiFont, getCalculatedFontSize(), config);
             }
 
+            drawContextMenu();
+
             window->display();
+
+            processThumbnailLoading();
 
             // Update map viewer if open
             if (mapViewer && mapViewer->isOpen()) {
@@ -2742,7 +4482,7 @@ class MgVwr {
             const float paddingX = 12.0f;
             const float paddingY = 8.0f;
             sf::Vector2f boxSize(bounds.size.x + paddingX * 2.0f, bounds.size.y + paddingY * 2.0f);
-            sf::Vector2f boxPos(15.0f, window->getSize().y - boxSize.y - 15.0f);
+            sf::Vector2f boxPos(15.0f, getBottomLeftOverlayY(boxSize.y));
 
             sf::RectangleShape background(boxSize);
             background.setPosition(boxPos);
@@ -2791,9 +4531,40 @@ class MgVwr {
 
             float padding = 12.0f;
             sf::Vector2f boxSize(maxWidth + padding * 2, lines.size() * lineSpacing + padding * 2);
-            // Position at bottom left, leave space for 2 lines of navigation text below (yellow text)
-            float reservedSpaceBelow = lineSpacing * 2 + padding * 2 + 15.0f;
-            sf::Vector2f boxPos(15.0f, window->getSize().y - boxSize.y - reservedSpaceBelow);
+
+            // Place filter box directly above active nav/jump message when present.
+            float boxY = getBottomLeftOverlayY(boxSize.y);
+            const float stackGap = 8.0f;
+            const float navPaddingY = 8.0f;
+
+            auto computeBottomOverlayTop = [&](const std::string &message) -> float {
+                sf::Text navText(uiFont, message, getCalculatedFontSize());
+                sf::FloatRect navBounds = navText.getLocalBounds();
+                sf::Vector2f navSize(navBounds.size.x + 12.0f * 2.0f, navBounds.size.y + navPaddingY * 2.0f);
+                return getBottomLeftOverlayY(navSize.y);
+            };
+
+            std::string rowMessage;
+            if (thumbnailCollectionMessageActive) {
+                rowMessage = folderMode ? "Collecting folder thumbs..." : "Collecting thumbs...";
+            } else if (metadataCollectionMessageActive) {
+                rowMessage = "Collecting image metadata...";
+            } else if (mapTileDownloadMessageActive) {
+                rowMessage = "Downloading map tiles...";
+            } else {
+                rowMessage = navigationMessage;
+            }
+
+            if (!rowMessage.empty()) {
+                float navTop = computeBottomOverlayTop(rowMessage);
+                boxY = navTop - boxSize.y - stackGap;
+            } else if (jumpedToOldest) {
+                float navTop = computeBottomOverlayTop("Jumped to 1st image in folder");
+                boxY = navTop - boxSize.y - stackGap;
+            }
+
+            boxY = std::max(0.0f, boxY);
+            sf::Vector2f boxPos(15.0f, boxY);
 
             sf::RectangleShape bg(boxSize);
             bg.setPosition(boxPos);
@@ -2816,20 +4587,33 @@ class MgVwr {
     }
 
     void drawNavigationMessage() {
-        if (navigationMessage.empty())
+        std::string rowMessage;
+        if (thumbnailCollectionMessageActive) {
+            rowMessage = folderMode ? "Collecting folder thumbs..." : "Collecting thumbs...";
+        } else if (metadataCollectionMessageActive) {
+            rowMessage = "Collecting image metadata...";
+        } else if (mapTileDownloadMessageActive) {
+            rowMessage = "Downloading map tiles...";
+        } else {
+            rowMessage = navigationMessage;
+        }
+
+        if (rowMessage.empty())
             return;
 
         if (uiFontLoaded) {
-            sf::Text text(uiFont, navigationMessage, getCalculatedFontSize());
+            sf::Text text(uiFont, rowMessage, getCalculatedFontSize());
 
-            // Use red for "Reached" messages (boundary warnings), yellow for others
-            text.setFillColor(navigationMessage.find("Reached") == 0 ? sf::Color::Red : sf::Color::Yellow);
+            bool isZoomBoundary = rowMessage == "Reached maximum zoom" || rowMessage == "Reached minimum zoom";
+            // Keep folder boundary warnings red; keep zoom limit messages yellow.
+            text.setFillColor((rowMessage.find("Reached") == 0 && !isZoomBoundary) ? sf::Color::Red
+                                                                                   : sf::Color::Yellow);
 
             sf::FloatRect bounds = text.getLocalBounds();
             const float paddingX = 12.0f;
             const float paddingY = 8.0f;
             sf::Vector2f boxSize(bounds.size.x + paddingX * 2.0f, bounds.size.y + paddingY * 2.0f);
-            sf::Vector2f boxPos(15.0f, window->getSize().y - boxSize.y - 15.0f);
+            sf::Vector2f boxPos(15.0f, getBottomLeftOverlayY(boxSize.y));
 
             sf::RectangleShape background(boxSize);
             background.setPosition(boxPos);
@@ -2840,6 +4624,73 @@ class MgVwr {
             window->draw(text);
             return;
         }
+    }
+
+    void presentFrameNow() {
+        if (!window) {
+            return;
+        }
+
+        window->clear(sf::Color::Black);
+        if (!thumbnailMode && sprite) {
+            window->draw(*sprite);
+        }
+        if (thumbnailMode) {
+            drawThumbnailGrid();
+        }
+
+        if (experimental && mapViewer && mapViewer->isOpen()) {
+            const sf::Texture *mapTexture = mapViewer->getTexture();
+            if (mapTexture) {
+                sf::Sprite mapSprite(*mapTexture);
+                auto windowSize = window->getSize();
+                auto mapSize = mapTexture->getSize();
+                float mapX = 0.f;
+                float mapY = getInlineMapY(windowSize.y, mapSize.y);
+                mapSprite.setPosition(sf::Vector2f(mapX, mapY));
+                window->draw(mapSprite);
+
+                if (!currentMapSubjectHasGps()) {
+                    sf::RectangleShape overlay(
+                        sf::Vector2f(static_cast<float>(mapSize.x), static_cast<float>(mapSize.y)));
+                    overlay.setPosition(sf::Vector2f(mapX, mapY));
+                    overlay.setFillColor(sf::Color::Black);
+                    window->draw(overlay);
+
+                    if (uiFontLoaded) {
+                        const std::string noMapText = "No map for this image (no GPS coordinates)";
+                        sf::Text text(uiFont, noMapText, getCalculatedFontSize());
+                        text.setFillColor(sf::Color::Red);
+                        sf::FloatRect bounds = text.getLocalBounds();
+                        float textX = mapX + std::max(8.f, (static_cast<float>(mapSize.x) - bounds.size.x) * 0.5f);
+                        float textY = mapY + (static_cast<float>(mapSize.y) - bounds.size.y) * 0.5f;
+                        text.setPosition(sf::Vector2f(textX, textY));
+                        window->draw(text);
+                    }
+                }
+            }
+        }
+
+        mapTileDownloadMessageActive =
+            mapViewer && mapViewer->isOpen() && currentMapSubjectHasGps() && mapViewer->isLoadingTiles();
+
+        if (!quietMode) {
+            drawTopLeftInfo();
+            drawFilterInfo();
+            drawMapInfo();
+            if (!navigationMessage.empty() || thumbnailCollectionMessageActive || metadataCollectionMessageActive ||
+                mapTileDownloadMessageActive) {
+                drawNavigationMessage();
+            } else if (jumpedToOldest) {
+                drawJumpedMessage();
+            }
+        }
+
+        if (showHelp) {
+            drawHelp(window, helpLines, uiFont, getCalculatedFontSize(), config);
+        }
+        drawContextMenu();
+        window->display();
     }
 
     static std::string formatDate(const std::string &dateTime) {
@@ -2883,27 +4734,12 @@ class MgVwr {
         if (!experimental || !mapViewer || !mapViewer->isOpen())
             return;
 
-        // Draw coordinates and zoom above map on left side
-        char coordStr[64];
-        snprintf(coordStr, sizeof(coordStr), "%.4f, %.4f z%d", mapViewer->getCenterLat(), mapViewer->getCenterLon(),
-                 mapViewer->getCurrentZoom());
-
-        sf::Text coordText(uiFont, coordStr);
-        coordText.setFillColor(sf::Color::White);
-        coordText.setCharacterSize(getCalculatedFontSize());
+        if (!currentMapSubjectHasGps()) {
+            return;
+        }
 
         auto windowSize = window->getSize();
         const sf::Texture *mapTexture = mapViewer->getTexture();
-        if (mapTexture) {
-            auto mapSize = mapTexture->getSize();
-            float mapX = 0.f;
-            float mapY = (windowSize.y - mapSize.y) / 2.0f;
-
-            sf::FloatRect textBounds = coordText.getLocalBounds();
-            // Position above map, left aligned with padding and blank line
-            coordText.setPosition(sf::Vector2f(mapX + 5.f, mapY - textBounds.size.y - getCalculatedFontSize() - 15.f));
-            window->draw(coordText);
-        }
 
         // Draw "Loading map" text below the map if tiles are loading
         if (mapViewer->isLoadingTiles()) {
@@ -2924,7 +4760,7 @@ class MgVwr {
             if (mapTexture) {
                 auto mapSize = mapTexture->getSize();
                 float mapX = 0.f;
-                float mapY = (windowSize.y - mapSize.y) / 2.0f;
+                float mapY = getInlineMapY(windowSize.y, mapSize.y);
 
                 sf::FloatRect loadingBounds = loadingText.getLocalBounds();
                 loadingText.setPosition(sf::Vector2f(mapX + 5.f, mapY + mapSize.y + 5.f));
@@ -2934,6 +4770,60 @@ class MgVwr {
     }
 
     void drawTopLeftInfo() {
+        if (folderMode) {
+            mapLinkAreas.clear();
+            navArrowAreas.clear();
+
+            if (!uiFontLoaded) {
+                return;
+            }
+
+            const float startX = 20.0f;
+            const float startY = 20.0f;
+            unsigned int fontSize = getCalculatedFontSize();
+            const float lineSpacing = static_cast<float>(fontSize + 4);
+
+            float arrowStartX = startX;
+            float arrowY = startY;
+            float arrowSize = static_cast<float>(fontSize);
+            float arrowSpacing = arrowSize + 12.0f;
+
+            std::vector<std::pair<NavArrow, std::string>> arrows = {
+                {NavArrow::Left, "<"},
+                {NavArrow::Right, ">"},
+                {NavArrow::Up, "^"},
+                {NavArrow::Down, "v"},
+            };
+
+            for (size_t a = 0; a < arrows.size(); a++) {
+                sf::Text arrowText(uiFont, arrows[a].second, static_cast<unsigned int>(arrowSize));
+                arrowText.setFillColor(sf::Color::White);
+                float arrowX = arrowStartX + static_cast<float>(a) * arrowSpacing;
+                arrowText.setPosition({arrowX, arrowY});
+                window->draw(arrowText);
+
+                float horizontalPadding = arrowSpacing * 0.4f;
+                float clickX = arrowX - horizontalPadding;
+                float clickY = arrowY - lineSpacing * 0.2f;
+                float clickWidth = arrowSpacing * 0.8f;
+                float clickHeight = lineSpacing * 1.4f;
+                sf::FloatRect clickArea(sf::Vector2f(clickX, clickY), sf::Vector2f(clickWidth, clickHeight));
+                navArrowAreas.push_back({arrows[a].first, clickArea});
+            }
+
+            std::string folderDisplay = watchedFoldersMode ? "Watched folders" : currentFolder.string();
+            if (!watchedFoldersMode && !folderDisplay.empty() && folderDisplay.back() != '/' &&
+                folderDisplay.back() != '\\') {
+                folderDisplay.push_back(fs::path::preferred_separator);
+            }
+
+            sf::Text folderText(uiFont, folderDisplay, fontSize);
+            folderText.setFillColor(sf::Color(144, 238, 144));
+            folderText.setPosition({startX, startY + lineSpacing});
+            window->draw(folderText);
+            return;
+        }
+
         if (allImagePaths.empty())
             return;
         const auto &imagePath = allImagePaths[currentIndex];
@@ -2972,8 +4862,6 @@ class MgVwr {
         lines.push_back(indexLine);
         lines.push_back("");
         const std::string installText = "Install Exiftool";
-        // Dynamic map text: "Hide map" when map is open, "Show on map" when closed
-        const std::string showOnMapText = (mapViewer && mapViewer->isOpen()) ? "Hide map" : "Show on map";
         if (!exiftoolAvailable) {
             lines.push_back(installText);
             lines.push_back("");
@@ -2985,6 +4873,9 @@ class MgVwr {
         std::string dt = getExifString(imagePath, "DateTimeOriginal");
         std::string dateLine = dt.empty() ? "" : formatDate(dt);
         std::string timeLine = dt.empty() ? "" : formatTime(dt);
+        if (timeLine == "00:00:00") {
+            timeLine.clear();
+        }
         if (!dateLine.empty()) {
             lines.push_back("");
             lines.push_back(dateLine);
@@ -3053,18 +4944,18 @@ class MgVwr {
             lines.push_back(description);
         }
 
-        // Add embedded map link if GPS coordinates are available
         bool hasValidGps = hasGpsLatitude(imagePath);
-        if (hasValidGps) {
-            lines.push_back("");
-            lines.push_back(showOnMapText);
-        }
 
         // Add map links if GPS coordinates are available
         if (hasValidGps && !maps.empty()) {
             lines.push_back(""); // Blank line before maps
             for (const auto &m : maps) {
-                lines.push_back(m.name);
+                std::string lowerName = m.name;
+                std::transform(lowerName.begin(), lowerName.end(), lowerName.begin(),
+                               [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+                if (lowerName.find("google") == std::string::npos) {
+                    lines.push_back(m.name);
+                }
             }
         }
 
@@ -3086,18 +4977,14 @@ class MgVwr {
         if (uiFontLoaded) {
             for (size_t i = 0; i < lines.size(); i++) {
                 // Check if this line is a map link and find which map it is
-                int mapIndex = -2;
-                if (lines[i] == showOnMapText) {
-                    mapIndex = -1;
-                } else {
-                    for (size_t m = 0; m < maps.size(); m++) {
-                        if (lines[i] == maps[m].name) {
-                            mapIndex = static_cast<int>(m);
-                            break;
-                        }
+                int mapIndex = -1;
+                for (size_t m = 0; m < maps.size(); m++) {
+                    if (lines[i] == maps[m].name) {
+                        mapIndex = static_cast<int>(m);
+                        break;
                     }
                 }
-                bool isMapLink = (mapIndex >= -1);
+                bool isMapLink = (mapIndex >= 0);
 
                 sf::String sfLine = sf::String::fromUtf8(lines[i].begin(), lines[i].end());
                 sf::Text text(uiFont, sfLine, fontSize);
@@ -3206,6 +5093,64 @@ class MgVwr {
             return;
         }
 
+        // F - toggle fullscreen/windowed
+        if (key.code == sf::Keyboard::Key::F) {
+            toggleWindowMode();
+            return;
+        }
+
+        // 0 - reset map zoom to default at the current map center
+        if (key.code == sf::Keyboard::Key::Num0 || key.code == sf::Keyboard::Key::Numpad0) {
+            if (mapViewer && mapViewer->isOpen()) {
+                mapViewer->showMap(mapViewer->getCenterLat(), mapViewer->getCenterLon(), defaultZoom);
+            }
+            return;
+        }
+
+        // Backspace - enter folder mode at parent/common folder (only within watched folder)
+        if (key.code == sf::Keyboard::Key::Backspace) {
+            if (thumbnailMode && folderMode && watchedFoldersMode) {
+                navigationMessage = "Reached top level";
+                return;
+            }
+
+            if (folderModeEligible && !currentWatchedFolder.empty() && isWithinCurrentWatchedFolder(currentFolder)) {
+                fs::path previousFolder = normalizePath(fs::absolute(currentFolder));
+
+                if (folderMode && previousFolder == normalizePath(fs::absolute(currentWatchedFolder))) {
+                    enterWatchedFoldersMode(previousFolder);
+                    return;
+                }
+
+                fs::path targetFolder = previousFolder.parent_path();
+
+                if (targetFolder.empty() || !isWithinCurrentWatchedFolder(targetFolder)) {
+                    targetFolder = computeSeenImagesCommonFolder();
+                    if (targetFolder.empty()) {
+                        targetFolder = previousFolder;
+                    }
+                    targetFolder = normalizePath(fs::absolute(targetFolder));
+                    if (targetFolder == previousFolder) {
+                        fs::path parent = targetFolder.parent_path();
+                        if (!parent.empty() && isWithinCurrentWatchedFolder(parent)) {
+                            targetFolder = parent;
+                        }
+                    }
+                }
+
+                if (!targetFolder.empty() && isWithinCurrentWatchedFolder(targetFolder)) {
+                    if (targetFolder == previousFolder) {
+                        enterWatchedFoldersMode(previousFolder);
+                    } else {
+                        enterFolderMode(targetFolder, previousFolder);
+                    }
+                } else {
+                    enterWatchedFoldersMode(previousFolder);
+                }
+            }
+            return;
+        }
+
         // Check filter toggle keys before processing navigation
         for (int i = 0; i < static_cast<int>(filters.size()); i++) {
             if (filters[i].key.size() == 1) {
@@ -3228,6 +5173,8 @@ class MgVwr {
                                 fs::path currentDir = allDirectories[currentIndex];
                                 fs::path currentImagePath =
                                     allImagePaths.empty() ? fs::path() : allImagePaths[currentIndex];
+
+                                refreshThumbnailsAfterImageSetChange();
 
                                 allImagePaths.clear();
                                 allDirectories.clear();
@@ -3269,42 +5216,153 @@ class MgVwr {
             }
         }
 
-        switch (key.code) {
-        case sf::Keyboard::Key::Num1:
-            if (key.shift) { // ! key (Shift+1)
-                quietMode = !quietMode;
-                if (quietMode) {
-                    mapLinkAreas.clear();
+        if (thumbnailMode && !folderMode && allImagePaths.empty()) {
+            return;
+        }
+
+        if (thumbnailMode && folderMode) {
+            if (folderModeEntries.empty()) {
+                return;
+            }
+
+            folderModeFocusIndex = std::min(folderModeFocusIndex, folderModeEntries.size() - 1);
+            ThumbnailLayout layout = computeThumbnailLayout();
+            size_t last = folderModeEntries.size() - 1;
+            size_t pageSize =
+                std::max<size_t>(1, static_cast<size_t>(layout.visibleRows) * static_cast<size_t>(thumbnailColumns));
+
+            switch (key.code) {
+            case sf::Keyboard::Key::Home:
+                folderModeFocusIndex = 0;
+                break;
+            case sf::Keyboard::Key::End:
+                folderModeFocusIndex = last;
+                break;
+            case sf::Keyboard::Key::PageUp:
+                if (folderModeFocusIndex >= pageSize) {
+                    folderModeFocusIndex -= pageSize;
+                } else {
+                    folderModeFocusIndex = 0;
                 }
+                break;
+            case sf::Keyboard::Key::PageDown:
+                folderModeFocusIndex = std::min(last, folderModeFocusIndex + pageSize);
+                break;
+            case sf::Keyboard::Key::Left:
+                if (folderModeFocusIndex > 0) {
+                    folderModeFocusIndex--;
+                }
+                break;
+            case sf::Keyboard::Key::Right:
+                if (folderModeFocusIndex < last) {
+                    folderModeFocusIndex++;
+                }
+                break;
+            case sf::Keyboard::Key::Up:
+                if (folderModeFocusIndex >= static_cast<size_t>(thumbnailColumns)) {
+                    folderModeFocusIndex -= static_cast<size_t>(thumbnailColumns);
+                }
+                break;
+            case sf::Keyboard::Key::Down:
+                if (folderModeFocusIndex + static_cast<size_t>(thumbnailColumns) <= last) {
+                    folderModeFocusIndex += static_cast<size_t>(thumbnailColumns);
+                }
+                break;
+            case sf::Keyboard::Key::Enter:
+                openFolderModeEntry(folderModeFocusIndex);
+                return;
+            default:
+                break;
+            }
+
+            ensureFolderModeFocusVisible();
+            refreshMapForFolderFocusSelection();
+            return;
+        }
+
+        switch (key.code) {
+        case sf::Keyboard::Key::Home:
+            if (thumbnailMode) {
+                currentIndex = getFirstInFolder();
+                onThumbnailSelectionChanged();
+            } else {
+                loadImage(getFirstInFolder());
+            }
+            break;
+
+        case sf::Keyboard::Key::PageDown:
+            if (thumbnailMode) {
+                moveThumbnailPageDownOrNextFolder();
+            } else {
+                metadataCollectionMessageActive = true;
+                presentFrameNow();
+                loadImage(getFirstInNextFolder());
+                metadataCollectionMessageActive = false;
+            }
+            break;
+
+        case sf::Keyboard::Key::Left:
+            if (thumbnailMode) {
+                currentIndex = getPrevInFolder();
+                onThumbnailSelectionChanged();
+            } else {
+                loadImage(getPrevInFolder());
             }
             break;
 
         case sf::Keyboard::Key::Right:
-            loadImage(getNextInFolder());
-            break;
-
-        case sf::Keyboard::Key::PageDown:
-            loadImage(getFirstInNextFolder());
-            break;
-
-        case sf::Keyboard::Key::Left:
-            loadImage(getPrevInFolder());
+            if (thumbnailMode) {
+                currentIndex = getNextInFolder();
+                onThumbnailSelectionChanged();
+            } else {
+                loadImage(getNextInFolder());
+            }
             break;
 
         case sf::Keyboard::Key::PageUp:
-            loadImage(getFirstInPrevFolder());
-            break;
-
-        case sf::Keyboard::Key::Home:
-            loadImage(getFirstInFolder());
+            if (thumbnailMode) {
+                moveThumbnailPageUpOrPrevFolder();
+            } else {
+                metadataCollectionMessageActive = true;
+                presentFrameNow();
+                loadImage(getFirstInPrevFolder());
+                metadataCollectionMessageActive = false;
+            }
             break;
 
         case sf::Keyboard::Key::End:
-            loadImage(getLastInFolder());
+            if (thumbnailMode) {
+                currentIndex = getLastInFolder();
+                onThumbnailSelectionChanged();
+            } else {
+                loadImage(getLastInFolder());
+            }
+            break;
+
+        case sf::Keyboard::Key::Up:
+            if (thumbnailMode && currentIndex >= static_cast<size_t>(thumbnailColumns)) {
+                currentIndex -= static_cast<size_t>(thumbnailColumns);
+                onThumbnailSelectionChanged();
+            }
+            break;
+
+        case sf::Keyboard::Key::Down:
+            if (thumbnailMode) {
+                size_t candidate = currentIndex + static_cast<size_t>(thumbnailColumns);
+                if (candidate < allImagePaths.size()) {
+                    currentIndex = candidate;
+                    onThumbnailSelectionChanged();
+                }
+            }
             break;
 
         case sf::Keyboard::Key::Enter:
-            toggleWindowMode();
+            if (thumbnailMode && !allImagePaths.empty() && currentIndex < allImagePaths.size()) {
+                thumbnailMode = false;
+                folderMode = false;
+                closeContextMenu();
+                loadImage(currentIndex);
+            }
             break;
 
         case sf::Keyboard::Key::W:
@@ -3315,10 +5373,8 @@ class MgVwr {
             break;
 
         case sf::Keyboard::Key::C:
-            if (key.control && !allImagePaths.empty()) {
-                std::string fullPath = toUtf8String(allImagePaths[currentIndex]);
-                sf::String clip = sf::String::fromUtf8(fullPath.begin(), fullPath.end());
-                sf::Clipboard::setString(clip);
+            if (key.control) {
+                copyImagePathToClipboard();
             }
             break;
 
@@ -3450,12 +5506,12 @@ std::vector<MapViewer::TileCoord> calculateTilesForView(double latitude, double 
     return tiles;
 }
 
-// Main function for --cache-osm mode
-int runCacheOsmMode(const std::vector<std::string> &paths, const std::string &configPath) {
-    log_stdout("OSM tile caching mode");
+// Main function for --cache mode
+int runCacheMode(const std::vector<std::string> &paths, const std::string &configPath) {
+    log_stdout("Cache prepopulation mode");
 
     // Load configuration using schema validation
-    std::string cacheDir;
+    fs::path cacheRoot;
     int defaultZoom = 15;
     unsigned int windowWidth = 1024;
     unsigned int windowHeight = 768;
@@ -3470,7 +5526,7 @@ int runCacheOsmMode(const std::vector<std::string> &paths, const std::string &co
         // Extract map cache location (schema-validated, safe to access directly)
         std::string location = config["map"]["cache"]["location"];
         if (!location.empty()) {
-            cacheDir = location;
+            cacheRoot = location;
         }
 
         // Extract zoom config
@@ -3491,18 +5547,12 @@ int runCacheOsmMode(const std::vector<std::string> &paths, const std::string &co
         throw;
     }
 
-    // Use same default cache location as GUI app if not specified
-    if (cacheDir.empty()) {
-        fs::path baseCacheLocation = getDefaultCacheLocation();
-        // Use different fallback for --cache-osm mode (osm_cache) vs GUI app (./cache/osm)
-        if (baseCacheLocation == fs::path(".") / "cache") {
-            cacheDir = "osm_cache"; // Backward compatibility for local directory fallback
-        } else {
-            cacheDir = (baseCacheLocation / "osm").string();
-        }
+    // Use same default cache location as GUI app if not specified.
+    if (cacheRoot.empty()) {
+        cacheRoot = getDefaultCacheLocation();
     }
 
-    log_stdout("Cache directory (config): ", cacheDir);
+    log_stdout("Cache root (config): ", cacheRoot.string());
 
     // Cache larger area to handle panning (3x window size in each direction)
     const int expandedWidth = windowWidth * 3;
@@ -3511,11 +5561,16 @@ int runCacheOsmMode(const std::vector<std::string> &paths, const std::string &co
     log_stdout("Expanded cache area: ", expandedWidth, "x", expandedHeight, " (to handle panning)");
 
     // Ensure cache directory exists
-    fs::create_directories(cacheDir);
-    log_stdout("Cache directory (resolved): ", fs::absolute(cacheDir).string());
+    fs::path osmCacheDir = cacheRoot / "osm";
+    fs::path thumbCacheDir = getThumbnailCacheLocation(cacheRoot);
+    fs::create_directories(cacheRoot);
+    fs::create_directories(osmCacheDir);
+    fs::create_directories(thumbCacheDir);
+    log_stdout("Cache root (resolved): ", fs::absolute(cacheRoot).string());
 
-    // Find exiftool using existing function
-    auto [exiftoolFound, exiftoolPath] = findExiftool();
+    // Find exiftool using metadata service
+    std::string exiftoolPath;
+    bool exiftoolFound = metadata::findExiftool(exiftoolPath);
     g_exiftoolPath = exiftoolPath;
     if (!exiftoolFound || g_exiftoolPath.empty()) {
         log_stderr("Error: exiftool not found. Please install exiftool.");
@@ -3543,17 +5598,46 @@ int runCacheOsmMode(const std::vector<std::string> &paths, const std::string &co
 
     log_stdout("Total image files: ", allFiles.size());
 
+    std::string metadataCacheError;
+    fs::path metadataCacheFile = metadata_cache::defaultMetadataCacheFile(cacheRoot);
+    if (metadata_cache::initializeMetadataCache(metadataCacheFile, metadataCacheError)) {
+        log_stdout("Metadata cache initialized at: ", pathToString(metadataCacheFile.make_preferred()));
+    } else {
+        log_stderr("Metadata cache initialization failed: ", metadataCacheError);
+        return 1;
+    }
+
     // Extract metadata in batches (to avoid command line length limits)
     const size_t batchSize = 50;
     ImageMetadataCache allMetadata;
+    bool hadErrors = false;
 
     for (size_t i = 0; i < allFiles.size(); i += batchSize) {
         size_t end = std::min(i + batchSize, allFiles.size());
         std::vector<fs::path> batch(allFiles.begin() + i, allFiles.begin() + end);
 
         log_stdout("Extracting metadata from files ", (i + 1), "-", end, "...");
-        auto batchMetadata = extractExiftoolData(batch);
+        auto batchMetadata = metadata::extractExiftoolData(batch, g_exiftoolPath);
         allMetadata.insert(batchMetadata.begin(), batchMetadata.end());
+
+        if (!metadata_cache::storeMetadataBatch(metadataCacheFile, batchMetadata, metadataCacheError)) {
+            log_stderr("Metadata cache write failed: ", metadataCacheError);
+            hadErrors = true;
+        }
+
+        for (const auto &[imagePath, _] : batchMetadata) {
+            fs::path thumbCacheFile = getThumbnailCacheFilePath(imagePath, cacheRoot);
+            std::error_code ec;
+            fs::create_directories(thumbCacheFile.parent_path(), ec);
+            if (ec) {
+                log_stderr("Failed to create thumbnail cache directory for ", imagePath.string(), ": ", ec.message());
+                continue;
+            }
+
+            if (!writeThumbnailCacheFile(imagePath, thumbCacheFile)) {
+                log_stderr("Failed to pre-cache thumbnail for ", imagePath.string());
+            }
+        }
     }
 
     auto hasValidGps = [](const json &meta) {
@@ -3610,8 +5694,7 @@ int runCacheOsmMode(const std::vector<std::string> &paths, const std::string &co
         int zoom = std::get<2>(tileCoord);
 
         // Build tile path
-        fs::path tilePath =
-            fs::path(cacheDir) / std::to_string(zoom) / std::to_string(x) / (std::to_string(y) + ".png");
+        fs::path tilePath = osmCacheDir / std::to_string(zoom) / std::to_string(x) / (std::to_string(y) + ".png");
 
         // Skip if already cached
         if (fs::exists(tilePath) && fs::file_size(tilePath) > 0) {
@@ -3654,7 +5737,7 @@ int runCacheOsmMode(const std::vector<std::string> &paths, const std::string &co
     log_stdout("Downloaded: ", downloadedCount, " tiles");
     log_stdout("Already cached: ", skippedCount, " tiles");
 
-    return 0;
+    return hadErrors ? 1 : 0;
 }
 
 // Helper function to extract metadata and output as YAML (used by --exiftool and --poor modes)
@@ -3740,6 +5823,23 @@ int runSelfCheck(const std::string &exePath, const std::string &configPath) {
     }
 }
 
+static int resolveLogRetentionDays(const fs::path &configFilePath) {
+    constexpr int defaultRetentionDays = 3;
+
+    try {
+        json logConfig = loadAndValidateConfigFile(configFilePath);
+        if (logConfig.contains("log") && logConfig["log"].is_object() && logConfig["log"].contains("retention_days") &&
+            logConfig["log"]["retention_days"].is_number_integer()) {
+            int retentionDays = logConfig["log"]["retention_days"].get<int>();
+            return std::max(0, retentionDays);
+        }
+    } catch (...) {
+        // Fall back to default when config cannot be parsed here.
+    }
+
+    return defaultRetentionDays;
+}
+
 // Simple argument parsing for our specific modes
 int main(int argc, char *argv[]) {
 #ifdef _WIN32
@@ -3747,6 +5847,8 @@ int main(int argc, char *argv[]) {
     SetConsoleOutputCP(CP_UTF8);
     SetConsoleCP(CP_UTF8);
 #endif
+
+    (void)initialize_app_logging(3);
 
     // Validate built-in schemas on startup
     try {
@@ -3757,17 +5859,10 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
-    // Log CLI command
-    std::string cliLine = "CLI:";
-    for (int i = 0; i < argc; ++i) {
-        cliLine += " " + std::string(argv[i]);
-    }
-    log_stdout(cliLine);
-
     // Parse command line arguments
     std::string configFile; // Default will be set by loadConfig if empty
     std::string imageFile;
-    std::string mode; // "", "self-check", "cache-osm", "exiftool", "poor"
+    std::string mode; // "", "self-check", "cache", "exiftool", "poor"
     std::vector<std::string> cachePaths;
 
     // Default config is exe path with .exe replaced by .yaml
@@ -3789,8 +5884,8 @@ int main(int argc, char *argv[]) {
                 log_stderr("Error: --config requires a file path");
                 return 1;
             }
-        } else if (arg == "--cache-osm") {
-            mode = "cache-osm";
+        } else if (arg == "--cache") {
+            mode = "cache";
             // Collect remaining arguments as paths
             for (int j = i + 1; j < argc; ++j) {
                 cachePaths.push_back(argv[j]);
@@ -3821,30 +5916,43 @@ int main(int argc, char *argv[]) {
         }
     }
 
+    apply_log_retention_policy(resolveLogRetentionDays(fs::path(configFile)));
+
+    // Log CLI command
+    std::string cliLine = "CLI:";
+    for (int i = 0; i < argc; ++i) {
+        cliLine += " " + std::string(argv[i]);
+    }
+    log_stdout(cliLine);
+
     // Handle self-check mode
     if (mode == "self-check") {
         return runSelfCheck(argv[0], configFile);
     }
 
-    // Handle cache-osm mode
-    if (mode == "cache-osm") {
+    // Handle cache mode
+    if (mode == "cache") {
         if (cachePaths.empty()) {
-            log_stderr("Error: --cache-osm requires at least one path");
+            log_stderr("Error: --cache requires at least one path");
             return 1;
         }
-        return runCacheOsmMode(cachePaths, configFile);
+        return runCacheMode(cachePaths, configFile);
     }
 
     // Handle exiftool mode
     if (mode == "exiftool") {
-        auto [found, path] = findExiftool();
-        g_exiftoolPath = path;
+        std::string resolvedExiftoolPath;
+        bool found = metadata::findExiftool(resolvedExiftoolPath);
+        g_exiftoolPath = resolvedExiftoolPath;
         if (!found || g_exiftoolPath.empty()) {
             log_stderr("Error: exiftool not found. Please install exiftool.");
             return 1;
         }
         const char *newArgv[] = {argv[0], "--exiftool", imageFile.c_str()};
-        return show_yaml_metadata(extractExiftoolData, 3, (char **)newArgv, "--exiftool");
+        auto extractFunc = [](const std::vector<fs::path> &paths) {
+            return metadata::extractExiftoolData(paths, g_exiftoolPath);
+        };
+        return show_yaml_metadata(extractFunc, 3, (char **)newArgv, "--exiftool");
     }
 
     // Handle poor mode
@@ -3853,22 +5961,13 @@ int main(int argc, char *argv[]) {
         return show_yaml_metadata(extractImageMetadata, 3, (char **)newArgv, "--poor");
     }
 
-    // Normal viewer mode
-    if (imageFile.empty()) {
-        log_stderr("Error: Image file required");
-        log_stderr("");
-        log_stderr("Usage: ", argv[0], " <image_file>");
-        log_stderr("   or: ", argv[0], " --config <file> <image_file>");
-        log_stderr("   or: ", argv[0], " --self-check [--config <file>]");
-        log_stderr("   or: ", argv[0], " --cache-osm <path> [<path> ...]");
-        log_stderr("   or: ", argv[0], " --exiftool <image_file>");
-        log_stderr("   or: ", argv[0], " --poor <image_file>");
-        log_stderr("");
-        log_stderr("Supported formats: JPG, PNG, BMP, GIF, TIFF");
-        return 1;
-    }
-
     try {
+        if (imageFile.empty()) {
+            MgVwr viewer{fs::path(), fs::path(argv[0]), configFile};
+            viewer.run();
+            return 0;
+        }
+
         // Expand glob patterns (especially important on Windows where shell doesn't expand *)
         std::vector<fs::path> expandedPaths = expandGlob(imageFile);
 

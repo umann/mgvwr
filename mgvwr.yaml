@@ -87,18 +87,22 @@ path_classifications:
 image_file:
   supported_suffixes: [".jpg", ".jpeg", ".png", ".bmp", ".gif", ".tiff"]
 watched_folders:
-  - "C:\\photos"
-  - "D:\\photos"
-  - "F:\\photos"
-  - "I:\\photos"
-  - "C:\\scan\\split"
-  - "D:\\scan\\split"
-  - "F:\\scan\\split"
-  - "I:\\scan\\split"
+  - folder: 'F:\photos'
+    auto_scan: true
+  - folder: 'F:\scan\split'
+    auto_scan: true
+  - folder: 'I:\photos'
+  - folder: 'I:\scan\split'
+  - folder: 'D:\photos'
+  - folder: 'D:\scan\split'
+  - folder: 'C:\photos'
+  - folder: 'C:\scan\split'
 window_mode:
   is_default: false
   default_size: ["80%", "80%"]
 quiet_mode: false
+log:
+  retention_days: 3
 filters:
   - expression: "Keywords % 'NOMINUS'"
     key: n

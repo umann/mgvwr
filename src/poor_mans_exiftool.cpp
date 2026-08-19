@@ -5,6 +5,7 @@
 
 #include "poor_mans_exiftool.h"
 #include "config.h"
+#include "exiftool_response_schema.h"
 #include "utils.h"
 #include <algorithm>
 #include <cstdint>
@@ -15,63 +16,6 @@
 #include <vector>
 
 static const std::vector<std::string> POOR_MANS_SUPPORTED_SUFFIXES = {".jpg", ".jpeg"};
-
-static constexpr const char *EXIFTOOL_RESPONSE_SCHEMA_YAML = R"(
-type: array
-items:  
-    type: object
-    additionalProperties: false
-    properties:
-        SourceFile:
-            type: string
-            minLength: 1
-            example: "F:/photos/2026/01/02/kornel_20260102_114713.jpg"
-        DateTimeOriginal:
-            type: string
-            pattern: "^\\d{4}:\\d{2}:\\d{2} \\d{2}:\\d{2}:\\d{2}$"
-            default: "0000:00:00 00:00:00"
-            example: "2026:01:02 11:47:14"
-        City:
-            type: string
-            default: ""
-            example: "Budapest"
-        Country:
-            type: string
-            default: ""
-            example: "Belgium"
-        State:
-            type: string
-            default: ""
-            example: "Pest megye"
-        Orientation:
-            type: integer
-            minimum: 1
-            maximum: 8
-            default: 1
-            example: 1
-        Keywords:
-            type: array
-            items:
-                type: string
-                minLength: 1
-                example: "apple"
-            default: []
-            example: ["apple", "banana"]
-        GPSLatitude:
-            type: ["number", "null"]
-            minimum: -90
-            maximum: 90
-            default: null
-            example: 47.675997
-        GPSLongitude:
-            type: ["number", "null"]
-            minimum: -180
-            maximum: 180
-            default: null
-            example: 19.1444994
-    required:
-        - SourceFile
-)";
 
 static bool isPoorMansSupportedExtension(const fs::path &imagePath) {
     std::string ext = imagePath.extension().string();
@@ -193,7 +137,7 @@ static int getExifOrientation(const std::string &imagePath) {
 
 // Extract EXIF DateTime tag (0x0132 for DateTime, or 0x9003 for DateTimeOriginal)
 // Returns datetime string in format "YYYY:MM:DD HH:MM:SS" or empty string if not found
-static std::string getExifDateTime(const std::vector<uint8_t> &data) {
+static std::string getExifTagString(const std::vector<uint8_t> &data, uint16_t targetTag, size_t minCount) {
     try {
         if (data.size() < 4)
             return "";
@@ -254,13 +198,16 @@ static std::string getExifDateTime(const std::vector<uint8_t> &data) {
 
                 auto readDateTimeAt = [&](uint32_t offset) -> std::string {
                     size_t stringPos = tiffStart + offset;
-                    if (stringPos + 19 < exif.size()) {
-                        std::string dateTime;
-                        for (int j = 0; j < 19; j++) {
-                            dateTime += static_cast<char>(exif[stringPos + j]);
+                    if (stringPos + minCount <= exif.size()) {
+                        std::string value;
+                        for (size_t j = 0; j < minCount; j++) {
+                            value += static_cast<char>(exif[stringPos + j]);
                         }
-                        if (dateTime.find(':') != std::string::npos) {
-                            return dateTime;
+                        while (!value.empty() && value.back() == '\0') {
+                            value.pop_back();
+                        }
+                        if (!value.empty()) {
+                            return value;
                         }
                     }
                     return "";
@@ -288,11 +235,10 @@ static std::string getExifDateTime(const std::vector<uint8_t> &data) {
                         uint32_t count = readLong(entryPos + 4);
                         uint32_t valueOffset = readLong(entryPos + 8);
 
-                        // DateTime tags: 0x0132 or 0x9003 (DateTimeOriginal)
-                        if ((tag == 0x0132 || tag == 0x9003) && valueType == 2 && count >= 19) {
-                            std::string dt = readDateTimeAt(valueOffset);
-                            if (!dt.empty()) {
-                                return dt;
+                        if (tag == targetTag && valueType == 2 && count >= minCount) {
+                            std::string value = readDateTimeAt(valueOffset);
+                            if (!value.empty()) {
+                                return value;
                             }
                         }
                     }
@@ -309,10 +255,10 @@ static std::string getExifDateTime(const std::vector<uint8_t> &data) {
                     uint32_t count = readLong(entryPos + 4);
                     uint32_t valueOffset = readLong(entryPos + 8);
 
-                    if ((tag == 0x0132 || tag == 0x9003) && valueType == 2 && count >= 19) {
-                        std::string dt = readDateTimeAt(valueOffset);
-                        if (!dt.empty()) {
-                            return dt;
+                    if (tag == targetTag && valueType == 2 && count >= minCount) {
+                        std::string value = readDateTimeAt(valueOffset);
+                        if (!value.empty()) {
+                            return value;
                         }
                     }
 
@@ -334,6 +280,18 @@ static std::string getExifDateTime(const std::vector<uint8_t> &data) {
         // Ignore errors
     }
     return "";
+}
+
+static std::string getExifDateTime(const std::vector<uint8_t> &data) {
+    std::string dateTimeOriginal = getExifTagString(data, 0x9003, 19);
+    if (!dateTimeOriginal.empty()) {
+        return dateTimeOriginal;
+    }
+    return getExifTagString(data, 0x0132, 19);
+}
+
+static std::string getExifOffsetTimeOriginal(const std::vector<uint8_t> &data) {
+    return getExifTagString(data, 0x9011, 6);
 }
 
 // Extract XMP metadata packet from JPEG data
@@ -764,6 +722,10 @@ std::map<fs::path, json> extractImageMetadata(const std::vector<fs::path> &image
             meta["SourceFile"] = imagePath.string();
 
             meta["DateTimeOriginal"] = getExifDateTime(fileData);
+            std::string offsetTimeOriginal = getExifOffsetTimeOriginal(fileData);
+            if (!offsetTimeOriginal.empty()) {
+                meta["OffsetTimeOriginal"] = offsetTimeOriginal;
+            }
 
             // Extract XMP packet for string fields
             std::string xmp = extractXmpPacket(fileData);

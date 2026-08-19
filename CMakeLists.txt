@@ -72,14 +72,98 @@ endif()
 set(SFML_STATIC_LIBRARIES TRUE)
 find_package(SFML 3.0 COMPONENTS Graphics Window System Network REQUIRED)
 
+find_path(SQLITE3_INCLUDE_DIR sqlite3.h)
+find_library(SQLITE3_LIBRARY NAMES sqlite3 libsqlite3)
+
+if(NOT SQLITE3_INCLUDE_DIR OR NOT SQLITE3_LIBRARY)
+    message(FATAL_ERROR "SQLite3 development files not found")
+endif()
+
 # Add executable
-add_executable(mgvwr src/main.cpp src/map_viewer.cpp src/config.cpp src/poor_mans_exiftool.cpp src/utils.cpp src/help.cpp)
+set(MGVWR_SOURCES
+    src/datetime_utils.cpp
+    src/main.cpp
+    src/cli.cpp
+    src/map_viewer.cpp
+    src/config.cpp
+    src/metadata.cpp
+    src/metadata_cache.cpp
+    src/poor_mans_exiftool.cpp
+    src/utils.cpp
+    src/help.cpp
+    src/html_utils.cpp
+    src/encoding_utils.cpp
+)
+
+# Generate embedded schema headers from external YAML files.
+set(MGVWR_GENERATED_DIR "${CMAKE_BINARY_DIR}/generated")
+file(MAKE_DIRECTORY "${MGVWR_GENERATED_DIR}")
+
+set(MGVWR_CONFIG_SCHEMA_FILE "${CMAKE_SOURCE_DIR}/data/json_schema/config.json_schema.yaml")
+set(MGVWR_EXIF_SCHEMA_FILE "${CMAKE_SOURCE_DIR}/data/json_schema/exiftool_repsonse.json_schema.yaml")
+
+set(MGVWR_CONFIG_SCHEMA_HEADER "${MGVWR_GENERATED_DIR}/config_schema_embedded.h")
+set(MGVWR_EXIF_SCHEMA_HEADER "${MGVWR_GENERATED_DIR}/exiftool_response_schema_embedded.h")
+
+add_custom_command(
+    OUTPUT "${MGVWR_CONFIG_SCHEMA_HEADER}"
+    COMMAND ${CMAKE_COMMAND}
+        -DINPUT_FILE=${MGVWR_CONFIG_SCHEMA_FILE}
+        -DOUTPUT_FILE=${MGVWR_CONFIG_SCHEMA_HEADER}
+        -DVAR_NAME=SCHEMA_YAML
+        -P "${CMAKE_SOURCE_DIR}/cmake/embed_text_as_header.cmake"
+    DEPENDS
+        "${MGVWR_CONFIG_SCHEMA_FILE}"
+        "${CMAKE_SOURCE_DIR}/cmake/embed_text_as_header.cmake"
+    VERBATIM
+)
+
+add_custom_command(
+    OUTPUT "${MGVWR_EXIF_SCHEMA_HEADER}"
+    COMMAND ${CMAKE_COMMAND}
+        -DINPUT_FILE=${MGVWR_EXIF_SCHEMA_FILE}
+        -DOUTPUT_FILE=${MGVWR_EXIF_SCHEMA_HEADER}
+        -DVAR_NAME=EXIFTOOL_RESPONSE_SCHEMA_YAML
+        -P "${CMAKE_SOURCE_DIR}/cmake/embed_text_as_header.cmake"
+    DEPENDS
+        "${MGVWR_EXIF_SCHEMA_FILE}"
+        "${CMAKE_SOURCE_DIR}/cmake/embed_text_as_header.cmake"
+    VERBATIM
+)
+
+add_custom_target(embed_schemas
+    DEPENDS
+        "${MGVWR_CONFIG_SCHEMA_HEADER}"
+        "${MGVWR_EXIF_SCHEMA_HEADER}"
+)
+
+if(WIN32)
+    if(MINGW)
+        # Some MinGW installs ship only windres.exe (without the triplet-prefixed alias).
+        find_program(MGVWR_WINDRES
+            NAMES windres x86_64-w64-mingw32-windres
+            HINTS "C:/msys64/mingw64/bin"
+        )
+
+        if(MGVWR_WINDRES)
+            set(CMAKE_RC_COMPILER "${MGVWR_WINDRES}" CACHE FILEPATH "Resource compiler" FORCE)
+            list(APPEND MGVWR_SOURCES src/mgvwr.rc)
+        else()
+            message(WARNING "No resource compiler found; mgvwr.exe icon resource will not be embedded.")
+        endif()
+    else()
+        list(APPEND MGVWR_SOURCES src/mgvwr.rc)
+    endif()
+endif()
+
+add_executable(mgvwr ${MGVWR_SOURCES})
+add_dependencies(mgvwr embed_schemas)
 
 # Link libraries
-target_link_libraries(mgvwr PRIVATE SFML::Graphics SFML::Window SFML::System SFML::Network yaml-cpp pantor::inja)
+target_link_libraries(mgvwr PRIVATE SFML::Graphics SFML::Window SFML::System SFML::Network yaml-cpp pantor::inja ${SQLITE3_LIBRARY})
 
 # Add include directory for json.hpp
-target_include_directories(mgvwr PRIVATE "${CMAKE_SOURCE_DIR}/src")
+target_include_directories(mgvwr PRIVATE "${CMAKE_SOURCE_DIR}/src" "${SQLITE3_INCLUDE_DIR}" "${MGVWR_GENERATED_DIR}")
 
 # For standalone builds, add all static dependencies AFTER SFML libraries
 # This ensures proper linking order for static libraries
