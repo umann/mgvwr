@@ -130,6 +130,16 @@ std::streambuf *g_originalCerr = nullptr;
 bool g_loggingInitialized = false;
 std::mutex g_logFileWriteMutex;
 
+void writeLogLineToFile(const std::string &message) {
+    if (!g_loggingInitialized || !g_logFile.is_open()) {
+        return;
+    }
+
+    std::lock_guard<std::mutex> lock(g_logFileWriteMutex);
+    g_logFile << "[" << getTimestamp() << "] " << message << "\n";
+    g_logFile.flush();
+}
+
 void shutdownAppLogging() {
     if (!g_loggingInitialized) {
         return;
@@ -340,14 +350,133 @@ std::string smart_join_impl(const std::vector<std::string> &parts) {
     return result;
 }
 
+std::string collapseSqlWhitespace(const std::string &sql) {
+    std::string out;
+    out.reserve(sql.size());
+    bool inWhitespace = false;
+    for (char ch : sql) {
+        if (std::isspace(static_cast<unsigned char>(ch))) {
+            if (!out.empty() && !inWhitespace) {
+                out.push_back(' ');
+                inWhitespace = true;
+            }
+            continue;
+        }
+        out.push_back(ch);
+        inWhitespace = false;
+    }
+    while (!out.empty() && out.back() == ' ') {
+        out.pop_back();
+    }
+    return out;
+}
+
+std::string sqliteValueToYamlString(sqlite3_stmt *stmt, int columnIndex) {
+    const int type = sqlite3_column_type(stmt, columnIndex);
+    switch (type) {
+        case SQLITE_INTEGER: {
+            return std::to_string(sqlite3_column_int64(stmt, columnIndex));
+        }
+        case SQLITE_FLOAT: {
+            std::ostringstream oss;
+            oss << sqlite3_column_double(stmt, columnIndex);
+            return oss.str();
+        }
+        case SQLITE_TEXT: {
+            const unsigned char *text = sqlite3_column_text(stmt, columnIndex);
+            std::string value = text ? reinterpret_cast<const char *>(text) : "";
+            std::string escaped;
+            escaped.reserve(value.size() + 2);
+            for (unsigned char ch : value) {
+                if (ch == '\\' || ch == '"') {
+                    escaped.push_back('\\');
+                }
+                escaped.push_back(static_cast<char>(ch));
+            }
+            return std::string("\"") + escaped + "\"";
+        }
+        case SQLITE_NULL:
+            return "null";
+        case SQLITE_BLOB:
+            return "<blob>";
+        default:
+            return "null";
+    }
+}
+
+void logSqlStatement(const std::string &sql) {
+    log_stdout("SQL: ", collapseSqlWhitespace(sql));
+}
+
+namespace sql {
+int prepare(sqlite3 *db, const char *sql, sqlite3_stmt **stmt) {
+    logSqlStatement(sql);
+    return sqlite3_prepare_v2(db, sql, -1, stmt, nullptr);
+}
+
+int exec(sqlite3 *db, const char *sql, char **errmsg) {
+    logSqlStatement(sql);
+    return sqlite3_exec(db, sql, nullptr, nullptr, errmsg);
+}
+
+int step(sqlite3_stmt *stmt, std::string &firstRow, int &rowCount) {
+    const int rc = sqlite3_step(stmt);
+    if (rc == SQLITE_ROW) {
+        ++rowCount;
+        if (rowCount == 1) {
+            const int columnCount = sqlite3_column_count(stmt);
+            std::string rowYaml = "{";
+            for (int i = 0; i < columnCount; ++i) {
+                if (i > 0) {
+                    rowYaml += ", ";
+                }
+                const char *name = sqlite3_column_name(stmt, i);
+                const std::string key = name ? std::string(name) : std::string("column") + std::to_string(i + 1);
+                rowYaml += key + ": " + sqliteValueToYamlString(stmt, i);
+            }
+            rowYaml += "}";
+            firstRow = rowYaml;
+        }
+    }
+    return rc;
+}
+}
+
+void logSqlSelectResult(const std::string &sql, sqlite3_stmt *stmt) {
+    logSqlStatement(sql);
+
+    int rowCount = 0;
+    std::string firstRow = "null";
+    while (sql::step(stmt, firstRow, rowCount) == SQLITE_ROW) {
+    }
+
+    log_stdout("Results: ", rowCount, " First: ", firstRow);
+}
+
 // Log message to stdout with timestamp
 void log_stdout_impl(const std::string &message) {
-    std::cout << "[" << getTimestamp() << "] " << message << "\n";
+    if (g_loggingInitialized) {
+        writeLogLineToFile(message);
+        if (g_originalCout) {
+            std::ostream originalOut(g_originalCout);
+            originalOut << message << "\n";
+            return;
+        }
+    }
+    std::cout << message << "\n";
 }
 
 // Log message to stderr with timestamp
 void log_stderr_impl(const std::string &message) {
-    std::cerr << "[" << getTimestamp() << "] " << message << "\n";
+    if (g_loggingInitialized) {
+        writeLogLineToFile(message);
+        if (g_originalCerr) {
+            std::ostream originalErr(g_originalCerr);
+            originalErr << message << "\n";
+            return;
+        }
+    }
+    std::cerr << message << "\n";
 }
 
 // Convert filesystem path to UTF-8 string

@@ -3,6 +3,7 @@
 #include <filesystem>
 #include <iostream>
 #include <sstream>
+#include <sqlite3.h>
 #include <string>
 #include <vector>
 
@@ -68,6 +69,25 @@ bool initialize_app_logging(int retentionDays = 3);
 
 // Apply retention policy for log files in the app log directory.
 void apply_log_retention_policy(int retentionDays);
+
+// Collapse SQL whitespace so it prints in one line.
+std::string collapseSqlWhitespace(const std::string &sql);
+
+// Render a SQLite column value in a compact YAML-like single-line form.
+std::string sqliteValueToYamlString(sqlite3_stmt *stmt, int columnIndex);
+
+// Centralized SQL abstraction used by all database components.
+namespace sql {
+int prepare(sqlite3 *db, const char *sql, sqlite3_stmt **stmt);
+int exec(sqlite3 *db, const char *sql, char **errmsg);
+int step(sqlite3_stmt *stmt, std::string &firstRow, int &rowCount);
+}
+
+// Log a SQL statement in one line.
+void logSqlStatement(const std::string &sql);
+
+// Log a SELECT result summary and the first row in YAML-like form.
+void logSqlSelectResult(const std::string &sql, sqlite3_stmt *stmt);
 
 // Log message to stdout with timestamp (supports variable arguments)
 template <typename... Args> void log_stdout(const Args &...args) {

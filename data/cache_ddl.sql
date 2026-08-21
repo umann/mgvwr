@@ -39,3 +39,118 @@ CREATE TABLE IF NOT EXISTS content (
 CREATE INDEX IF NOT EXISTS ix_content_taken ON content(taken);
 CREATE INDEX IF NOT EXISTS ix_content_latitude ON content(latitude);
 CREATE INDEX IF NOT EXISTS ix_content_longitude ON content(longitude);
+
+
+CREATE TABLE IF NOT EXISTS fts_key (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL UNIQUE CHECK (name IN (
+        "DateOriginal",
+        "YearMonthOriginal",
+        "YearOriginal",
+        "Creator",
+        "Country",
+        "State",
+        "City",
+        "Location",
+        "Description",
+        "Keyword",
+        "Face",
+        "Make",
+        "Model"
+    )),
+    enabled INTEGER NOT NULL DEFAULT 1 CHECK (enabled IN (0, 1))
+);
+
+INSERT INTO fts_key (name)
+VALUES
+    ("DateOriginal"),
+    ("YearOriginal"),
+    ("YearMonthOriginal"),
+    ("Creator"),
+    ("Country"),
+    ("State"),
+    ("City"),
+    ("Location"),
+    ("Description"),
+    ("Keyword"),
+    ("Face"),
+    ("Make"),
+    ("Model")
+ON CONFLICT(name) DO NOTHING;
+
+
+CREATE TABLE IF NOT EXISTS token (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    /*
+    Any kinda text, accented or not, might contain spaces but not leading/trailing/consecutive spaces,
+    used for filtering & searching. Examples: "Eiffel Tower", "John Doe", "Paris", "2023-08-15", "14:00"
+    */
+    name TEXT NOT NULL UNIQUE CHECK (
+        name GLOB '[^ ]*'  -- no leading space, at least 1 char
+        AND name GLOB '*[^ ]'  -- no trailing space
+        AND name NOT GLOB '*  *'  -- no consecutive spaces
+        AND instr(name, char(9)) = 0  -- no tab
+        AND instr(name, char(10)) = 0 -- no newline
+        AND instr(name, char(13)) = 0 -- no carriage return
+        AND instr(name, '(') = 0
+        AND instr(name, ')') = 0
+        AND instr(name, '|') = 0
+        AND name NOT GLOB '-*'  -- no leading dash, reserved for search syntax
+    )
+);
+CREATE TABLE IF NOT EXISTS content_token (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    content_id INTEGER NOT NULL REFERENCES content(id) ON DELETE CASCADE,
+    fts_key_id INTEGER NOT NULL REFERENCES fts_key(id),
+    token_id INTEGER NOT NULL REFERENCES token(id)
+);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_content_token ON content_token (
+   token_id,
+   content_id,
+   fts_key_id
+);
+
+CREATE TABLE IF NOT EXISTS word (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL UNIQUE CHECK (
+        length(name) > 0
+        AND name NOT GLOB '*[][ !"()*,:;<=>?{|}^`' || char(30) || '-' || char(31) || ']*'  -- no punctuation chars
+    ),
+    simple TEXT NOT NULL CHECK (
+        length(simple) > 0
+        AND simple NOT GLOB '*[^0-9a-z+./-]*'
+    )  -- lowercase unaccented ASCII + selected sigils
+);
+
+CREATE INDEX IF NOT EXISTS ix_word_simple ON word(simple);
+CREATE INDEX IF NOT EXISTS ix_word_name ON word(name);
+
+CREATE TABLE IF NOT EXISTS token_word (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    token_id INTEGER NOT NULL REFERENCES token(id) ON DELETE CASCADE,
+    word_id INTEGER NOT NULL REFERENCES word(id) ON DELETE CASCADE
+);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_token_word ON token_word (
+   token_id,
+   word_id
+);
+
+CREATE INDEX IF NOT EXISTS ix_token_word ON token_word (
+   word_id,
+   token_id
+);
+
+
+SELECT 
+d.name || f.basename as fullpath,
+k.name as fts_key_name,
+t.name as token_name
+FROM file f
+JOIN dir d ON f.dir_id = d.id
+JOIN content c ON f.id = c.file_id
+JOIN content_token ct ON c.id = ct.content_id
+JOIN fts_key k ON ct.fts_key_id = k.id
+JOIN token t ON ct.token_id = t.id
+JOIN token_word tw ON t.id = tw.token_id
+JOIN word w ON tw.word_id = w.id
+WHERE w.name like '%rdf%';

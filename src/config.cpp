@@ -2,9 +2,12 @@
 #include "utils.h"
 #include <filesystem>
 #include <fstream>
+#include <iomanip>
 #include <iostream>
+#include <limits>
 #include <optional>
 #include <stdexcept>
+#include <sstream>
 #include <yaml-cpp/yaml.h>
 
 namespace fs = std::filesystem;
@@ -202,6 +205,197 @@ struct SchemaResolver {
 static bool validate_against(const SchemaResolver &R, const json &schema, const json &instance);
 static bool validate_against_with_path(const SchemaResolver &R, const json &schema, const json &instance,
                                        const std::string &path, bool suppressErrors = false);
+static void coerce_string_like_values(const SchemaResolver &R, const json &schema, json &instance);
+
+static std::string stringify_json_number(const json &value) {
+    if (value.is_number_integer()) {
+        return std::to_string(value.get<long long>());
+    }
+    if (value.is_number_unsigned()) {
+        return std::to_string(value.get<unsigned long long>());
+    }
+    if (value.is_number_float()) {
+        std::ostringstream oss;
+        oss.setf(std::ios::fmtflags(0), std::ios::floatfield);
+        oss << std::setprecision(std::numeric_limits<double>::max_digits10) << value.get<double>();
+        return oss.str();
+    }
+    return value.dump();
+}
+
+static std::optional<double> parse_json_number_string(const std::string &text) {
+    try {
+        size_t parsedChars = 0;
+        double value = std::stod(text, &parsedChars);
+        if (parsedChars == text.size()) {
+            return value;
+        }
+    } catch (...) {
+    }
+    return std::nullopt;
+}
+
+static bool schema_expects_string(const json &schema) {
+    if (!schema.is_object() || !schema.contains("type")) {
+        return false;
+    }
+
+    const json &typeConstraint = schema["type"];
+    auto matches = [&](const std::string &typeName) {
+        return typeName == "string";
+    };
+
+    if (typeConstraint.is_string()) {
+        return matches(typeConstraint.get<std::string>());
+    }
+
+    if (typeConstraint.is_array()) {
+        for (const auto &entry : typeConstraint) {
+            if (entry.is_string() && matches(entry.get<std::string>())) {
+                return true;
+            }
+        }
+    }
+
+    return false;
+}
+
+static bool schema_expects_string_array(const json &schema) {
+    if (!schema.is_object() || !schema.contains("type") || !schema.contains("items")) {
+        return false;
+    }
+
+    const json &typeConstraint = schema["type"];
+    bool isArrayType = false;
+    if (typeConstraint.is_string()) {
+        isArrayType = typeConstraint.get<std::string>() == "array";
+    } else if (typeConstraint.is_array()) {
+        for (const auto &entry : typeConstraint) {
+            if (entry.is_string() && entry.get<std::string>() == "array") {
+                isArrayType = true;
+                break;
+            }
+        }
+    }
+
+    if (!isArrayType) {
+        return false;
+    }
+
+    const json &itemsSchema = schema["items"];
+    return itemsSchema.is_object() && schema_expects_string(itemsSchema);
+}
+
+static bool schema_expects_number(const json &schema) {
+    if (!schema.is_object() || !schema.contains("type")) {
+        return false;
+    }
+
+    const json &typeConstraint = schema["type"];
+    auto matches = [&](const std::string &typeName) {
+        return typeName == "number" || typeName == "integer";
+    };
+
+    if (typeConstraint.is_string()) {
+        return matches(typeConstraint.get<std::string>());
+    }
+
+    if (typeConstraint.is_array()) {
+        for (const auto &entry : typeConstraint) {
+            if (entry.is_string() && matches(entry.get<std::string>())) {
+                return true;
+            }
+        }
+    }
+
+    return false;
+}
+
+static bool schema_expects_number_array(const json &schema) {
+    if (!schema.is_object() || !schema.contains("type") || !schema.contains("items")) {
+        return false;
+    }
+
+    const json &typeConstraint = schema["type"];
+    bool isArrayType = false;
+    if (typeConstraint.is_string()) {
+        isArrayType = typeConstraint.get<std::string>() == "array";
+    } else if (typeConstraint.is_array()) {
+        for (const auto &entry : typeConstraint) {
+            if (entry.is_string() && entry.get<std::string>() == "array") {
+                isArrayType = true;
+                break;
+            }
+        }
+    }
+
+    if (!isArrayType) {
+        return false;
+    }
+
+    const json &itemsSchema = schema["items"];
+    return itemsSchema.is_object() && schema_expects_number(itemsSchema);
+}
+
+static void coerce_string_like_values(const SchemaResolver &R, const json &schema, json &instance) {
+    if (!schema.is_object()) {
+        return;
+    }
+
+    json resolvedSchema = R.resolve(schema);
+
+    if (schema_expects_string(resolvedSchema) && instance.is_number()) {
+        instance = stringify_json_number(instance);
+        return;
+    }
+
+    if (schema_expects_number(resolvedSchema) && instance.is_string()) {
+        if (const auto parsedNumber = parse_json_number_string(instance.get<std::string>()); parsedNumber.has_value()) {
+            if (resolvedSchema.contains("type") && resolvedSchema["type"].is_string() &&
+                resolvedSchema["type"].get<std::string>() == "integer") {
+                instance = static_cast<std::int64_t>(*parsedNumber);
+            } else {
+                instance = *parsedNumber;
+            }
+            return;
+        }
+    }
+
+    if (resolvedSchema.contains("allOf") && resolvedSchema["allOf"].is_array()) {
+        for (const auto &subSchema : resolvedSchema["allOf"]) {
+            coerce_string_like_values(R, subSchema, instance);
+        }
+    }
+
+    if (instance.is_object() && resolvedSchema.contains("properties") && resolvedSchema["properties"].is_object()) {
+        const json &props = resolvedSchema["properties"];
+        for (const auto &[key, propSchema] : props.items()) {
+            if (!instance.contains(key)) {
+                continue;
+            }
+            coerce_string_like_values(R, propSchema, instance[key]);
+        }
+    }
+
+    if (instance.is_array() && resolvedSchema.contains("items")) {
+        const json &itemsSchema = resolvedSchema["items"];
+        for (auto &element : instance) {
+            if (schema_expects_string(itemsSchema) && element.is_number()) {
+                element = stringify_json_number(element);
+            } else if (schema_expects_number(itemsSchema) && element.is_string()) {
+                if (const auto parsedNumber = parse_json_number_string(element.get<std::string>()); parsedNumber.has_value()) {
+                    if (itemsSchema.contains("type") && itemsSchema["type"].is_string() &&
+                        itemsSchema["type"].get<std::string>() == "integer") {
+                        element = static_cast<std::int64_t>(*parsedNumber);
+                    } else {
+                        element = *parsedNumber;
+                    }
+                }
+            }
+            coerce_string_like_values(R, itemsSchema, element);
+        }
+    }
+}
 
 static bool is_object_schema(const json &S) {
     if (!S.is_object())
@@ -702,23 +896,20 @@ json enrichAndValidateJsonWithSchemaYaml(const std::string &schemaYaml, const js
         enriched = json::object();
     }
 
+    coerce_string_like_values(resolver, schemaJson, *enriched);
+
     // Validate the enriched config
     try {
         if (!validate_against(resolver, schemaJson, *enriched)) {
             // Build detailed error message
-            std::string enrichedStr = enriched.has_value() ? enriched->dump(2) : "{}";
             std::stringstream errorMsg;
             errorMsg << "Schema validation failed.\n\n";
-            errorMsg << "Enriched configuration data:\n";
-            errorMsg << enrichedStr << "\n\n";
             errorMsg << "Check stderr output above for validation error details.\n";
             throw std::runtime_error(errorMsg.str());
         }
     } catch (const nlohmann::json::exception &je) {
-        std::string enrichedStr = enriched.has_value() ? enriched->dump(2) : "{}";
         std::stringstream errorMsg;
         errorMsg << "JSON validation error: " << je.what() << "\n\n";
-        errorMsg << "Enriched configuration:\n" << enrichedStr << "\n";
         throw std::runtime_error(errorMsg.str());
     }
 

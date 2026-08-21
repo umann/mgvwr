@@ -15,7 +15,9 @@ namespace metadata {
 namespace {
 
 static const std::vector<std::string> EXIF_STRING_KEYS = {
-    "City", "Country", "DateTimeOriginal", "Description", "Location", "OffsetTimeOriginal", "Orientation", "State",
+    "City",           "Country", "Creator", "DateTimeOriginal",   "Description",
+    "Location",       "Make",    "Model",   "OffsetTimeOriginal", "Orientation",
+    "XMP:RegionInfo", "State",
 };
 
 void markMetadataComplete(MetadataByPath &targetCache, const fs::path &imagePath, const json &metadata) {
@@ -98,7 +100,7 @@ MetadataByPath extractExiftoolData(const std::vector<fs::path> &imagePaths, cons
     }
 
     try {
-        std::string cliFlags = "-j -n -q";
+        std::string cliFlags = "-j -n -q -struct";
         for (const auto &key : EXIF_STRING_KEYS) {
             cliFlags += " -" + key;
         }
@@ -109,16 +111,16 @@ MetadataByPath extractExiftoolData(const std::vector<fs::path> &imagePaths, cons
                 return;
             }
 
+            std::string cmd;
+            std::string exiftoolPathFixed = exiftoolPath;
             std::string imagePathsArg;
+
             for (size_t i = 0; i < batch.size(); ++i) {
                 if (i > 0) {
                     imagePathsArg += "\" \"";
                 }
                 imagePathsArg += batch[i].string();
             }
-
-            std::string cmd;
-            std::string exiftoolPathFixed = exiftoolPath;
 
 #ifdef _WIN32
             for (char &c : exiftoolPathFixed) {
@@ -136,7 +138,7 @@ MetadataByPath extractExiftoolData(const std::vector<fs::path> &imagePaths, cons
             cmd = "\"" + exiftoolPathFixed + "\" " + cliFlags + " \"" + imagePathsArg + "\"";
 #endif
 
-            log_stdout("DEBUG", "Exiftool batch command: ", cmd);
+            log_stdout("Exiftool batch command: ", cmd);
 
             FILE *pipe = popen(cmd.c_str(), "r");
             if (!pipe) {
@@ -153,17 +155,36 @@ MetadataByPath extractExiftoolData(const std::vector<fs::path> &imagePaths, cons
 
             log_stdout("DEBUG", "exiftool exit code: ", exitCode, ", output size: ", output.size(), " bytes");
             if (exitCode != 0 || output.empty()) {
-                log_stdout("DEBUG", "exiftool failed or returned no output");
+                log_stdout("DEBUG", "exiftool failed or returned no output: ", output);
                 return;
             }
 
             auto jsonData = json::parse(output);
+            if (jsonData.is_array()) {
+                for (auto &record : jsonData) {
+                    if (!record.is_object() || !record.contains("Creator")) {
+                        continue;
+                    }
+                    if (record["Creator"].is_array() && !record["Creator"].empty() &&
+                        record["Creator"][0].is_string()) {
+                        record["Creator"] = record["Creator"][0].get<std::string>();
+                    }
+                    if (record.contains("Orientation") && record["Orientation"].is_number_integer()) {
+                        const int orientation = record["Orientation"].get<int>();
+                        if (orientation < 1 || orientation > 8) {
+                            record.erase("Orientation");
+                        }
+                    }
+                }
+            }
             try {
                 jsonData = enrichAndValidateJsonWithSchemaYaml(EXIFTOOL_RESPONSE_SCHEMA_YAML, jsonData);
             } catch (const std::exception &e) {
                 log_stdout("DEBUG", "Exiftool response schema validation failed: ", e.what());
                 return;
             }
+
+            std::vector<fs::path> missingRegionInfo;
 
             for (const auto &record : jsonData) {
                 if (!record.is_object() || !record.contains("SourceFile")) {
@@ -172,9 +193,35 @@ MetadataByPath extractExiftoolData(const std::vector<fs::path> &imagePaths, cons
                 try {
                     fs::path imagePath(record["SourceFile"].get<std::string>());
                     results[imagePath] = record;
-                    log_stdout("DEBUG", "Extracted metadata for ", imagePath.filename().string());
+                    if (!record.contains("RegionInfo") || !record["RegionInfo"].is_object()) {
+                        missingRegionInfo.push_back(imagePath);
+                    }
+                    log_stdout("Extracted metadata for ", imagePath.filename().string());
                 } catch (const std::exception &e) {
-                    log_stdout("DEBUG", "Error processing record: ", e.what());
+                    log_stdout("Error processing record: ", e.what());
+                }
+            }
+
+            if (!missingRegionInfo.empty()) {
+                auto fallbackResults = extractImageMetadata(missingRegionInfo);
+                for (const auto &imagePath : missingRegionInfo) {
+                    auto exifIt = results.find(imagePath);
+                    if (exifIt == results.end()) {
+                        continue;
+                    }
+
+                    auto fallbackIt = fallbackResults.find(imagePath);
+                    if (fallbackIt == fallbackResults.end()) {
+                        continue;
+                    }
+
+                    const json &fallbackMeta = fallbackIt->second;
+                    if (!fallbackMeta.is_object() || !fallbackMeta.contains("RegionInfo") ||
+                        !fallbackMeta["RegionInfo"].is_object()) {
+                        continue;
+                    }
+
+                    exifIt->second["RegionInfo"] = fallbackMeta["RegionInfo"];
                 }
             }
         };

@@ -367,6 +367,131 @@ static std::string extractXmpOrIptcValue(const std::string &xmp, const std::vect
     return extractIptcValue(data, record, dataset);
 }
 
+static std::optional<double> parseNumericAttributeValue(const std::string &text, const std::string &name) {
+    const std::string key = name + "=\"";
+    const auto pos = text.find(key);
+    if (pos == std::string::npos) {
+        return std::nullopt;
+    }
+    const auto start = pos + key.size();
+    const auto end = text.find('"', start);
+    if (end == std::string::npos || end <= start) {
+        return std::nullopt;
+    }
+    try {
+        return std::stod(text.substr(start, end - start));
+    } catch (...) {
+        return std::nullopt;
+    }
+}
+
+static json extractXmpRegionInfo(const std::string &xmp) {
+    json regionInfo = json::object();
+    const std::string regionInfoTag = "<RegionInfo";
+    const std::string regionInfoClose = "</RegionInfo>";
+    const std::string xmpRegionInfoTag = "<xmp:RegionInfo";
+    const std::string xmpRegionInfoClose = "</xmp:RegionInfo>";
+
+    size_t start = xmp.find(regionInfoTag);
+    if (start == std::string::npos) {
+        start = xmp.find(xmpRegionInfoTag);
+    }
+    if (start == std::string::npos) {
+        return regionInfo;
+    }
+
+    size_t openTagEnd = xmp.find('>', start);
+    if (openTagEnd == std::string::npos) {
+        return regionInfo;
+    }
+
+    size_t end = xmp.find(regionInfoClose, openTagEnd);
+    if (end == std::string::npos) {
+        end = xmp.find(xmpRegionInfoClose, openTagEnd);
+    }
+    if (end == std::string::npos) {
+        return regionInfo;
+    }
+
+    std::string regionContent = xmp.substr(openTagEnd + 1, end - openTagEnd - 1);
+    json regionList = json::array();
+
+    const std::string regionListStart = "<RegionList";
+    const std::string regionListClose = "</RegionList>";
+    const std::string xmpRegionListStart = "<xmp:RegionList";
+    const std::string xmpRegionListClose = "</xmp:RegionList>";
+    size_t regionListPos = regionContent.find(regionListStart);
+    if (regionListPos == std::string::npos) {
+        regionListPos = regionContent.find(xmpRegionListStart);
+    }
+    if (regionListPos != std::string::npos) {
+        size_t regionListEnd = regionContent.find(regionListClose, regionListPos);
+        if (regionListEnd == std::string::npos) {
+            regionListEnd = regionContent.find(xmpRegionListClose, regionListPos);
+        }
+        if (regionListEnd != std::string::npos) {
+            std::string regionListContent = regionContent.substr(regionListPos, regionListEnd - regionListPos);
+            std::string regionTag = "<rdf:li";
+            size_t liPos = regionListContent.find(regionTag);
+            while (liPos != std::string::npos) {
+                size_t liEnd = regionListContent.find("</rdf:li>", liPos);
+                if (liEnd == std::string::npos) {
+                    break;
+                }
+                std::string itemXml = regionListContent.substr(liPos, liEnd - liPos + std::string("</rdf:li>").size());
+                json item = json::object();
+
+                const std::string nameTag = "<Name";
+                size_t namePos = itemXml.find(nameTag);
+                if (namePos != std::string::npos) {
+                    size_t nameStart = itemXml.find('>', namePos);
+                    size_t nameEnd = itemXml.find("</Name>", nameStart);
+                    if (nameStart != std::string::npos && nameEnd != std::string::npos && nameEnd > nameStart) {
+                        std::string name = trimWhitespace(itemXml.substr(nameStart + 1, nameEnd - nameStart - 1));
+                        if (!name.empty()) {
+                            item["Name"] = name;
+                        }
+                    }
+                }
+
+                const std::string areaTag = "<Area";
+                size_t areaPos = itemXml.find(areaTag);
+                if (areaPos != std::string::npos) {
+                    size_t areaEnd = itemXml.find('>', areaPos);
+                    if (areaEnd != std::string::npos) {
+                        std::string areaAttributes = itemXml.substr(areaPos, areaEnd - areaPos + 1);
+                        json area = json::object();
+                        auto addAreaValue = [&](const std::string &key) {
+                            auto opt = parseNumericAttributeValue(areaAttributes, key);
+                            if (opt.has_value()) {
+                                area[key] = *opt;
+                            }
+                        };
+                        addAreaValue("H");
+                        addAreaValue("W");
+                        addAreaValue("X");
+                        addAreaValue("Y");
+                        if (!area.empty()) {
+                            item["Area"] = area;
+                        }
+                    }
+                }
+
+                if (!item.empty()) {
+                    regionList.push_back(item);
+                }
+
+                liPos = regionListContent.find(regionTag, liPos + 1);
+            }
+        }
+    }
+
+    if (!regionList.empty()) {
+        regionInfo["RegionList"] = regionList;
+    }
+    return regionInfo;
+}
+
 static std::vector<std::string> extractXmpKeywordArray(const std::string &xmp, const std::vector<std::string> &tags) {
     std::vector<std::string> result;
     const std::regex liRegex(R"(<rdf:li[^>]*>(.*?)</rdf:li>)");
@@ -701,6 +826,12 @@ std::map<fs::path, json> extractImageMetadata(const std::vector<fs::path> &image
         }
     };
 
+    auto setIfPresent = [](json &meta, const std::string &key, const std::string &value) {
+        if (!key.empty() && !value.empty()) {
+            meta[key] = value;
+        }
+    };
+
     for (const auto &imagePath : imagePaths) {
         try {
             if (!isPoorMansSupportedExtension(imagePath)) {
@@ -730,40 +861,64 @@ std::map<fs::path, json> extractImageMetadata(const std::vector<fs::path> &image
             json meta = json::object();
             meta["SourceFile"] = imagePath.string();
 
-            meta["DateTimeOriginal"] = getExifDateTime(fileData);
+            setIfPresent(meta, "DateTimeOriginal", getExifDateTime(fileData));
             std::string offsetTimeOriginal = getExifOffsetTimeOriginal(fileData);
-            if (!offsetTimeOriginal.empty()) {
-                meta["OffsetTimeOriginal"] = offsetTimeOriginal;
-            }
+            setIfPresent(meta, "OffsetTimeOriginal", offsetTimeOriginal);
 
             // Extract XMP packet for string fields
             std::string xmp = extractXmpPacket(fileData);
 
-            meta["Country"] = extractXmpOrIptcValue(xmp,
-                                                    {"photoshop:Country", "Iptc4xmpCore:CountryName",
-                                                     "Iptc4xmpExt:LocationShownCountryName", "xmp:Country"},
-                                                    fileData, 0x02, 0x65);
+            auto regionInfo = extractXmpRegionInfo(xmp);
+            if (!regionInfo.empty()) {
+                meta["RegionInfo"] = regionInfo;
+            }
 
-            meta["State"] = extractXmpOrIptcValue(xmp,
-                                                  {"photoshop:State", "Iptc4xmpCore:ProvinceState",
-                                                   "Iptc4xmpExt:LocationShownProvinceState", "xmp:State"},
-                                                  fileData, 0x02, 0x5F);
+            setIfPresent(meta, "Creator",
+                         extractXmpOrIptcValue(xmp,
+                                               {"dc:creator", "photoshop:Credit", "Iptc4xmpCore:Creator",
+                                                "Iptc4xmpExt:PersonInImage", "xmp:Creator"},
+                                               fileData, 0x01, 0x80));
 
-            meta["City"] = extractXmpOrIptcValue(
-                xmp, {"photoshop:City", "Iptc4xmpCore:City", "Iptc4xmpExt:LocationShownCity", "xmp:City"}, fileData,
-                0x02, 0x5A);
+            setIfPresent(meta, "Country",
+                         extractXmpOrIptcValue(xmp,
+                                               {"photoshop:Country", "Iptc4xmpCore:CountryName",
+                                                "Iptc4xmpExt:LocationShownCountryName", "xmp:Country"},
+                                               fileData, 0x02, 0x65));
 
-            meta["Location"] =
-                extractXmpOrIptcValue(xmp,
-                                      {"Iptc4xmpCore:Location", "photoshop:Location", "photoshop:Sublocation",
-                                       "Iptc4xmpExt:LocationShownLocation", "xmp:Location"},
-                                      fileData, 0x02, 0x5C);
+            setIfPresent(meta, "State",
+                         extractXmpOrIptcValue(xmp,
+                                               {"photoshop:State", "Iptc4xmpCore:ProvinceState",
+                                                "Iptc4xmpExt:LocationShownProvinceState", "xmp:State"},
+                                               fileData, 0x02, 0x5F));
 
-            meta["Description"] =
-                extractXmpOrIptcValue(xmp,
-                                      {"dc:description", "photoshop:Caption", "Iptc4xmpCore:Description",
-                                       "Iptc4xmpExt:Description", "xmp:Description"},
-                                      fileData, 0x02, 0x69);
+            setIfPresent(meta, "City",
+                         extractXmpOrIptcValue(
+                             xmp, {"photoshop:City", "Iptc4xmpCore:City", "Iptc4xmpExt:LocationShownCity", "xmp:City"},
+                             fileData, 0x02, 0x5A));
+
+            setIfPresent(meta, "Location",
+                         extractXmpOrIptcValue(xmp,
+                                               {"Iptc4xmpCore:Location", "photoshop:Location", "photoshop:Sublocation",
+                                                "Iptc4xmpExt:LocationShownLocation", "xmp:Location"},
+                                               fileData, 0x02, 0x5C));
+
+            setIfPresent(meta, "Description",
+                         extractXmpOrIptcValue(xmp,
+                                               {"dc:description", "photoshop:Caption", "Iptc4xmpCore:Description",
+                                                "Iptc4xmpExt:Description", "xmp:Description"},
+                                               fileData, 0x02, 0x69));
+
+            std::string make = getExifTagString(fileData, 0x010F, 1);
+            if (make.empty()) {
+                make = extractXmpValue(xmp, {"tiff:Make", "exif:Make", "xmp:Make"});
+            }
+            setIfPresent(meta, "Make", make);
+
+            std::string model = getExifTagString(fileData, 0x0110, 1);
+            if (model.empty()) {
+                model = extractXmpValue(xmp, {"tiff:Model", "exif:Model", "xmp:Model"});
+            }
+            setIfPresent(meta, "Model", model);
 
             // Extract Keywords (as array)
             std::vector<std::string> xmpKeywords =
