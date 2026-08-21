@@ -1,31 +1,12 @@
 #include "help.h"
+#include "html_utils.h"
 #include "utils.h"
-#include <cctype>
 #include <filesystem>
 #include <inja/inja.hpp>
 #include <sstream>
 
-static constexpr const char *INJA_TEMPLATE = R"(Esc               Close Help / Exit App  
-F1                Toggle Help  
-Right             Next image in folder  
-Left              Prev image in folder  
-PageDown          Next folder  
-PageUp            Prev folder  
-Home              First image in folder  
-End               Last image in folder  
-.                 Toggle Map  
-Ctrl c            Copy selection if any, else copy image full path  
-Ctrl +            Zoom Map In
-Ctrl -            Zoom Map Out
-0                 Reset Map Zoom to Default  
-Enter             Toggle Fullscreen
-F1                Toggle Help
-MouseWheel        Next/Prev  
-Ctrl MouseWheel   Zoom Map  
-{% for filter in config.filters %}{{ filter.key }}                 Toggle Filter: {{ filter.expression }}  
-{% endfor %})";
 
-static constexpr const char *UNUSED_HTML_INJA_TEMPLATE_BUT_DO_NOT_DELETE_IT = R"(
+static constexpr const char *HTML_INJA_TEMPLATE = R"(
 <!DOCTYPE html> 
 <html lang="en">    
 <head>        
@@ -34,22 +15,21 @@ static constexpr const char *UNUSED_HTML_INJA_TEMPLATE_BUT_DO_NOT_DELETE_IT = R"
 <body>
 <p>Keys</p>
 <table>
-    <tr><td>Esc</td><td>Close Help / App</td></tr>
+    <tr><td>Esc</td><td>Exit Help / App</td></tr>
+    <tr><td>F1</td><td>Toggle Help</td></tr>
     <tr><td>Right</td><td>Next image in folder</td></tr>
     <tr><td>Left</td><td>Previous image in folder</td></tr>
-    <tr><td>PageDown</td><td>Next folder</td></tr>
-    <tr><td>PageUp</td><td>Previous folder</td></tr>
+    <tr><td>PageDown</td><td>Next folder / Next page of thumbs within folder</td></tr>
+    <tr><td>PageUp</td><td>Prev folder / Prev page of thumbs within folder</td></tr>
     <tr><td>Home</td><td>First image in folder</td></tr>
     <tr><td>End</td><td>Last image in folder</td></tr>
     <tr><td>.</td><td>Toggle Map</td></tr>
-    <tr><td>Ctrl c</td><td>Copy selection if any<br>else copy image full path</td></tr>
-    <tr><td>Ctrl +</td><td>Zoom Map In</td></tr>
-    <tr><td>Ctrl -</td><td>Zoom Map Out</td></tr>
+    <tr><td>Backspace</td><td>Up to Thumbnails</td></tr>
     <tr><td>0</td><td>Zoom Map to Default</td></tr>
-    <tr><td>Enter</td><td>Toggle Fullscreen</td></tr>
-    <tr><td>F1</td><td>Toggle Help</td></tr>
-    <tr><td>MouseWheel</td><td>Next/Prev</td></tr>
-    <tr><td>Ctrl MouseWheel</td><td>Zoom Map</td></tr>{% for filter in config.filters %}
+    <tr><td>F</td><td>Toggle Fullscreen</td></tr>
+    <tr><td>Enter</td><td>Open selected image/folder of thumb</td></tr>
+    <tr><td>MouseWheel</td><td>Next / Prev</td></tr>
+    <tr><td>Ctrl MouseWheel</td><td>Zoom Map / Change Thumb Size</td></tr>{% for filter in config.filters %}
     <tr><td>{{ filter.key }}</td><td>Toggle Filter: {{ filter.expression }}</td></tr>
 {% endfor %}
 </table>
@@ -65,12 +45,17 @@ std::vector<std::string> loadHelpContent(const json &config) {
         json templateData;
         templateData["config"] = config;
 
-        // Render template with inja from string
+        // Render HTML template with inja, then convert the first table to plain text.
         inja::Environment env;
-        std::string rendered = env.render(INJA_TEMPLATE, templateData);
+        std::string rendered = env.render(HTML_INJA_TEMPLATE, templateData);
+        std::string helpText = first_html_table_to_text(rendered);
+
+        if (helpText.empty()) {
+            helpText = rendered;
+        }
 
         // Simple line splitting for plain text
-        std::istringstream stream(rendered);
+        std::istringstream stream(helpText);
         std::string line;
         while (std::getline(stream, line)) {
             helpLines.push_back(line);
@@ -170,7 +155,7 @@ void usage(const std::string &programName, const std::string &message) {
     log_stderr("Usage: ", programName, " <image_file>");
     log_stderr("   or: ", programName, " --config <file> <image_file>");
     log_stderr("   or: ", programName, " --self-check [--config <file>]");
-    log_stderr("   or: ", programName, " --cache-osm [--config <file>] [--zoom <level>] <path> [<path> ...]");
+    log_stderr("   or: ", programName, " --cache [--config <file>] [--zoom <level>] <path> [<path> ...]");
     log_stderr("   or: ", programName, " --exiftool <image_file>");
     log_stderr("   or: ", programName, " --poor <image_file>");
     log_stderr("   or: ", programName, " [--config <file>] [--zoom <level>] <image_file>");

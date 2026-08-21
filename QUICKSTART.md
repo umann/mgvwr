@@ -67,7 +67,8 @@ Edit `mgvwr.yaml` before building:
 
 ```yaml
 watched_folders:
-  - "C:\\Users\\YourName\\Pictures"  # Your photo folder
+  - folder: 'C:\Users\YourName\Pictures'  # Your photo folder
+    auto_scan: true
 
 filters:
   - key: "1"                          # Press '1' to filter

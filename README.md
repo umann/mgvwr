@@ -73,10 +73,28 @@ ninja
 
 Or use `build.bat` from Windows Command Prompt.
 
+### Embedded Schemas
+
+Schema sources are maintained as YAML files and embedded into the executable at build time:
+
+- `data/json_schema/config.json_schema.yaml`
+- `data/json_schema/exiftool_repsonse.json_schema.yaml`
+
+During build, CMake runs `cmake/embed_text_as_header.cmake` to generate headers under the build directory:
+
+- `build_windows/generated/config_schema_embedded.h`
+- `build_windows/generated/exiftool_response_schema_embedded.h`
+
+These generated headers are compiled into `mgvwr.exe`, so the app remains standalone and does not need schema files at runtime.
+
+When you edit a schema YAML file, rebuild and CMake will regenerate the corresponding embedded header automatically.
+
 ## Configuration
 
+The app uses YAML configuration via `mgvwr.yaml`.
+
 Edit `mgvwr.yaml` to configure:
-- Watched folders for image scanning
+- Watched folders for image viewing and optional metadata auto scanning
 - Map providers and zoom levels
 - Keyword filters
 - Font paths and sizes

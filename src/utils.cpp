@@ -1,15 +1,195 @@
 #include "utils.h"
 #include <algorithm>
 #include <chrono>
+#include <cstdlib>
 #include <ctime>
 #include <filesystem>
+#include <fstream>
 #include <iomanip>
 #include <iostream>
+#include <memory>
+#include <mutex>
 #include <regex>
 #include <sstream>
 
-
 namespace fs = std::filesystem;
+
+namespace {
+
+std::string formatLogPrefixTimestamp() {
+    auto now = std::chrono::system_clock::now();
+    auto nowTime = std::chrono::system_clock::to_time_t(now);
+
+    std::tm localTm = *std::localtime(&nowTime);
+    std::tm utcTm = *std::gmtime(&nowTime);
+
+    auto localEpoch = std::mktime(&localTm);
+    auto utcEpoch = std::mktime(&utcTm);
+    long offsetSeconds = static_cast<long>(std::difftime(localEpoch, utcEpoch));
+
+    char sign = '+';
+    if (offsetSeconds < 0) {
+        sign = '-';
+        offsetSeconds = -offsetSeconds;
+    }
+
+    int offsetHours = static_cast<int>(offsetSeconds / 3600);
+    int offsetMinutes = static_cast<int>((offsetSeconds % 3600) / 60);
+
+    std::ostringstream oss;
+    oss << std::put_time(&localTm, "%Y-%m-%d %H:%M:%S") << sign << std::setw(2) << std::setfill('0') << offsetHours
+        << ":" << std::setw(2) << std::setfill('0') << offsetMinutes;
+    return oss.str();
+}
+
+std::string formatLogFileTimestamp() {
+    auto now = std::chrono::system_clock::now();
+    auto nowTime = std::chrono::system_clock::to_time_t(now);
+    std::tm localTm = *std::localtime(&nowTime);
+
+    std::ostringstream oss;
+    oss << std::put_time(&localTm, "%Y%m%d_%H%M%S");
+    return oss.str();
+}
+
+fs::path getDefaultLogDirectory() {
+#ifdef _WIN32
+    const char *localAppData = std::getenv("LOCALAPPDATA");
+    if (localAppData && *localAppData) {
+        return fs::path(localAppData) / "Umann" / "MgVwr" / "logs";
+    }
+#endif
+    return fs::current_path() / "logs";
+}
+
+class TimestampPrefixTeeBuf : public std::streambuf {
+  public:
+    TimestampPrefixTeeBuf(std::streambuf *primaryBuf, std::ostream *fileStream, std::mutex *fileMutex)
+        : primary(primaryBuf), file(fileStream), writeMutex(fileMutex), atLineStart(true) {}
+
+  protected:
+    int overflow(int ch) override {
+        if (ch == traits_type::eof()) {
+            return traits_type::not_eof(ch);
+        }
+
+        if (primary && primary->sputc(static_cast<char>(ch)) == traits_type::eof()) {
+            return traits_type::eof();
+        }
+
+        if (file && file->good()) {
+            std::lock_guard<std::mutex> lock(*writeMutex);
+            char c = static_cast<char>(ch);
+            if (atLineStart && c != '\n') {
+                (*file) << formatLogPrefixTimestamp() << " ";
+                atLineStart = false;
+            }
+            file->put(c);
+            if (c == '\n') {
+                atLineStart = true;
+            }
+            file->flush();
+        }
+
+        return ch;
+    }
+
+    std::streamsize xsputn(const char *s, std::streamsize count) override {
+        std::streamsize written = 0;
+        for (; written < count; ++written) {
+            if (overflow(static_cast<unsigned char>(s[written])) == traits_type::eof()) {
+                break;
+            }
+        }
+        return written;
+    }
+
+    int sync() override {
+        if (primary && primary->pubsync() == -1) {
+            return -1;
+        }
+        if (file) {
+            std::lock_guard<std::mutex> lock(*writeMutex);
+            file->flush();
+        }
+        return 0;
+    }
+
+  private:
+    std::streambuf *primary;
+    std::ostream *file;
+    std::mutex *writeMutex;
+    bool atLineStart;
+};
+
+std::ofstream g_logFile;
+std::unique_ptr<TimestampPrefixTeeBuf> g_coutTee;
+std::unique_ptr<TimestampPrefixTeeBuf> g_cerrTee;
+std::streambuf *g_originalCout = nullptr;
+std::streambuf *g_originalCerr = nullptr;
+bool g_loggingInitialized = false;
+std::mutex g_logFileWriteMutex;
+
+void shutdownAppLogging() {
+    if (!g_loggingInitialized) {
+        return;
+    }
+
+    if (g_originalCout) {
+        std::cout.rdbuf(g_originalCout);
+    }
+    if (g_originalCerr) {
+        std::cerr.rdbuf(g_originalCerr);
+    }
+
+    g_coutTee.reset();
+    g_cerrTee.reset();
+
+    if (g_logFile.is_open()) {
+        g_logFile.flush();
+        g_logFile.close();
+    }
+
+    g_loggingInitialized = false;
+}
+
+void pruneOldLogs(const fs::path &logDir, int retentionDays) {
+    if (retentionDays < 0) {
+        retentionDays = 0;
+    }
+
+    std::error_code ec;
+    if (!fs::exists(logDir, ec) || !fs::is_directory(logDir, ec)) {
+        return;
+    }
+
+    auto cutoff = fs::file_time_type::clock::now() - std::chrono::hours(24 * retentionDays);
+    std::regex namePattern(R"(^mrvwr_\d{8}_\d{6}\.log$)");
+
+    for (const auto &entry : fs::directory_iterator(logDir, fs::directory_options::skip_permission_denied, ec)) {
+        if (ec || !entry.is_regular_file()) {
+            continue;
+        }
+
+        const std::string fileName = entry.path().filename().string();
+        if (!std::regex_match(fileName, namePattern)) {
+            continue;
+        }
+
+        std::error_code timeEc;
+        auto writeTime = fs::last_write_time(entry.path(), timeEc);
+        if (timeEc) {
+            continue;
+        }
+
+        if (writeTime < cutoff) {
+            std::error_code removeEc;
+            fs::remove(entry.path(), removeEc);
+        }
+    }
+}
+
+} // namespace
 
 // Convert path to display string with single backslashes on Windows
 std::string pathToString(const fs::path &path) {
@@ -49,6 +229,42 @@ std::string getTimestamp() {
     std::stringstream ss;
     ss << std::put_time(std::localtime(&time), "%Y-%m-%d %H:%M:%S");
     return ss.str();
+}
+
+bool initialize_app_logging(int retentionDays) {
+    if (g_loggingInitialized) {
+        apply_log_retention_policy(retentionDays);
+        return true;
+    }
+
+    fs::path logDir = getDefaultLogDirectory();
+    std::error_code ec;
+    fs::create_directories(logDir, ec);
+    if (ec) {
+        return false;
+    }
+
+    fs::path logFilePath = logDir / ("mrvwr_" + formatLogFileTimestamp() + ".log");
+    g_logFile.open(logFilePath, std::ios::out | std::ios::app);
+    if (!g_logFile.is_open()) {
+        return false;
+    }
+
+    g_originalCout = std::cout.rdbuf();
+    g_originalCerr = std::cerr.rdbuf();
+    g_coutTee = std::make_unique<TimestampPrefixTeeBuf>(g_originalCout, &g_logFile, &g_logFileWriteMutex);
+    g_cerrTee = std::make_unique<TimestampPrefixTeeBuf>(g_originalCerr, &g_logFile, &g_logFileWriteMutex);
+    std::cout.rdbuf(g_coutTee.get());
+    std::cerr.rdbuf(g_cerrTee.get());
+
+    g_loggingInitialized = true;
+    std::atexit(shutdownAppLogging);
+    apply_log_retention_policy(retentionDays);
+    return true;
+}
+
+void apply_log_retention_policy(int retentionDays) {
+    pruneOldLogs(getDefaultLogDirectory(), retentionDays);
 }
 
 // Get current OS name ("windows", "macos", or "linux")
