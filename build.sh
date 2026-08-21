@@ -75,6 +75,7 @@ cmake -Wno-deprecated .. "${CMAKE_ARGS[@]}"
 # Copy runtime DLLs next to executable (MinGW/MSYS2) - only if not standalone
 if [ "$STANDALONE" = false ] && [[ -d /mingw64/bin ]]; then
     RUNTIME_DLLS=(
+        libsqlite3-0.dll
         libfreetype-6.dll
         libbrotlidec.dll
         libbrotlicommon.dll

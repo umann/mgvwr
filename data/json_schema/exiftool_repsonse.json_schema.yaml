@@ -10,62 +10,100 @@ items:
     DateTimeOriginal:
       type: string
       pattern: "^[12][0-9]{3}:[01][0-9]:[0-3][0-9] [01][0-9]:[0-5][0-9]:[0-5][0-9]$"
-      default: "0000:00:00 00:00:00"
       example: "2026:01:02 11:47:14"
     OffsetTimeOriginal:
       type: string
       pattern: "^[+-][01][0-9]:(?:00|15|30|45)$"
-      default: "+00:00"
       example: "+01:00"
+    Creator:
+      type: string
+      example: "Budapest"
     City:
       type: string
-      default: ""
       example: "Budapest"
     Location:
       type: string
-      default: ""
       example: "Margit-sziget"
     Country:
       type: string
-      default: ""
       example: "Belgium"
     State:
       type: string
-      default: ""
       example: "Pest megye"
     Description:
       type: string
-      default: ""
       example: "A beautiful landscape photo."
     Orientation:
       type: integer
       minimum: 1
       maximum: 8
-      default: 1
       example: 7
     Keywords:
       type: array
       items:
         type: string
-        minLength: 1
         example: "apple"
-      default: []
       example: ["apple", "banana"]
     GPSLatitude:
       type: ["number", "null"]
       minimum: -90
       maximum: 90
-      default: null
       example: 47.675997
     GPSLongitude:
       type: ["number", "null"]
       minimum: -180
       maximum: 180
-      default: null
       example: 19.1444994
+    RegionInfo:
+      type: object
+      properties:
+        RegionList:
+          type: array
+          items:
+            type: object
+            required:
+              - Name
+            properties:
+              Area:
+                type: object
+                required:
+                  - H
+                  - W
+                  - X
+                  - Y
+                properties:
+                  H:
+                    type: number
+                    minimum: 0.0
+                    maximum: 1.0
+                    example: 0.0382391088731212
+                  W:
+                    type: number
+                    minimum: 0.0
+                    maximum: 1.0
+                    example: 0.0235294117647059
+                  X:
+                    type: number
+                    minimum: 0.0
+                    maximum: 1.0
+                    example: 0.456870374608988
+                  Y:
+                    type: number
+                    minimum: 0.0
+                    maximum: 1.0
+                    example: 0.470099946593423
+              Name:
+                type: string
+                minLength: 1
+                example: "Doe John"
+    Make:
+      type: string
+      example: "Nokia"
+    Model:
+      type: string
+      example: "2110"
     filters:
       type: object
       additionalProperties: false
-      default: {}
   required:
     - SourceFile
