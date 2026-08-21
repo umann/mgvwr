@@ -67,7 +67,7 @@ else
     echo "Building with dynamic libraries..."
 fi
 
-cmake .. "${CMAKE_ARGS[@]}"
+cmake -Wno-deprecated .. "${CMAKE_ARGS[@]}"
 
 # Build
 "${BUILD_CMD[@]}" -j"$(nproc)"

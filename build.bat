@@ -42,10 +42,10 @@ REM Configure with CMake
 echo Configuring build...
 if "%STANDALONE%"=="ON" (
     echo Building standalone executable (static linking)
-    cmake .. -G Ninja -DBUILD_STANDALONE=ON
+    cmake -Wno-deprecated .. -G Ninja -DBUILD_STANDALONE=ON
 ) else (
     echo Building with dynamic libraries
-    cmake .. -G Ninja
+    cmake -Wno-deprecated .. -G Ninja
 )
 
 if errorlevel 1 (

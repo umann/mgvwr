@@ -7,7 +7,6 @@
 #include <iostream>
 #include <sstream>
 
-
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
 #endif
@@ -195,6 +194,32 @@ int MapViewer::getFolderNavigationRequest() {
     int request = folderNavigationRequest;
     folderNavigationRequest = 0; // Reset after reading
     return request;
+}
+
+bool MapViewer::zoomIn() {
+    if (currentZoom < maxZoom) {
+        currentZoom++;
+        tileTextures.clear();
+        tilesLoaded = 0;
+        zoomBoundaryMessage.clear();
+        std::cout << "[" << getTimestamp() << "] [Map Viewer] Zoom level: " << currentZoom << std::endl;
+        return true;
+    }
+    zoomBoundaryMessage = "Maximum Zoom is " + std::to_string(maxZoom);
+    return false;
+}
+
+bool MapViewer::zoomOut() {
+    if (currentZoom > minZoom) {
+        currentZoom--;
+        tileTextures.clear();
+        tilesLoaded = 0;
+        zoomBoundaryMessage.clear();
+        std::cout << "[" << getTimestamp() << "] [Map Viewer] Zoom level: " << currentZoom << std::endl;
+        return true;
+    }
+    zoomBoundaryMessage = "Minimum Zoom is " + std::to_string(minZoom);
+    return false;
 }
 
 bool MapViewer::isPointInStayPutArea(double lat, double lon) const {
@@ -431,18 +456,16 @@ void MapViewer::handleEvent(const sf::Event &event, sf::Vector2i mouseOffset) {
             centerLon = markerLon;
             viewOffset = sf::Vector2f(0.f, 0.f);
             break;
-        case sf::Keyboard::Key::Equal: // + key
-        case sf::Keyboard::Key::Add:
-            if (currentZoom < maxZoom) {
-                currentZoom++;
-                tileTextures.clear(); // Clear loaded tiles for new zoom
+        case sf::Keyboard::Key::Equal: // Ctrl + '=' or Ctrl + '+' (shifted)
+        case sf::Keyboard::Key::Add:   // Ctrl + numpad '+'
+            if (keyEvent->control) {
+                zoomIn();
             }
             break;
-        case sf::Keyboard::Key::Hyphen: // - key
-        case sf::Keyboard::Key::Subtract:
-            if (currentZoom > minZoom) {
-                currentZoom--;
-                tileTextures.clear(); // Clear loaded tiles for new zoom
+        case sf::Keyboard::Key::Hyphen:   // Ctrl + '-'
+        case sf::Keyboard::Key::Subtract: // Ctrl + numpad '-'
+            if (keyEvent->control) {
+                zoomOut();
             }
             break;
         case sf::Keyboard::Key::Home:
@@ -495,16 +518,10 @@ void MapViewer::handleEvent(const sf::Event &event, sf::Vector2i mouseOffset) {
 
         if (ctrlHeld) {
             // Ctrl+Wheel: Zoom in/out (scroll up = zoom in, scroll down = zoom out)
-            if (wheelEvent->delta > 0 && currentZoom < maxZoom) {
-                currentZoom++;
-                std::cout << "[" << getTimestamp() << "] [Map Viewer] Zoom level: " << currentZoom << std::endl;
-                tileTextures.clear();
-                tilesLoaded = 0; // Reset progress bar
-            } else if (wheelEvent->delta < 0 && currentZoom > minZoom) {
-                currentZoom--;
-                std::cout << "[" << getTimestamp() << "] [Map Viewer] Zoom level: " << currentZoom << std::endl;
-                tileTextures.clear();
-                tilesLoaded = 0; // Reset progress bar
+            if (wheelEvent->delta > 0) {
+                zoomIn();
+            } else if (wheelEvent->delta < 0) {
+                zoomOut();
             }
         } else if (shiftHeld) {
             // Shift+Wheel: Folder navigation (up = prev folder, down = next folder)

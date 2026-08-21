@@ -39,3 +39,7 @@ void validateSchemaYaml(const std::string& schemaYaml, const std::string& schema
 // Validate all built-in schemas on startup.
 // Throws std::runtime_error if any schema is invalid.
 void validateBuiltInSchemas();
+
+// Self-check: validate built-in schemas, EXIF schema, and config enrichment.
+int runSelfCheck(const std::string &exePath, const std::string &configPath,
+				 const std::string &exiftoolResponseSchemaYaml);

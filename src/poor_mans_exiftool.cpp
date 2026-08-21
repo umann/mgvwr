@@ -329,7 +329,16 @@ static std::string extractXmpValue(const std::string &xmp, const std::vector<std
                 std::string closeTag = "</" + tag + ">";
                 size_t end = xmp.find(closeTag, gt + 1);
                 if (end != std::string::npos) {
-                    return xmp.substr(gt + 1, end - gt - 1);
+                    std::string value = xmp.substr(gt + 1, end - gt - 1);
+
+                    // Handle RDF Alt/Seq/Bag structures - extract from <rdf:li> tags
+                    const std::regex liRegex(R"(<rdf:li[^>]*>(.*?)</rdf:li>)");
+                    std::smatch match;
+                    if (std::regex_search(value, match, liRegex) && match.size() > 1) {
+                        return trimWhitespace(match[1].str());
+                    }
+
+                    return trimWhitespace(value);
                 }
             }
         }
