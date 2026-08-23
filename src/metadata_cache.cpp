@@ -20,8 +20,9 @@ When creating new PNG thumbnail, add comment "SourceFile: <imagePath>" to the PN
 
 #include "metadata_cache.h"
 #include "datetime_utils.h"
-#include "json.hpp"
 #include "utils.h"
+
+#include <nlohmann/json.hpp>
 
 #include <SFML/Graphics/Image.hpp>
 #include <algorithm>
@@ -38,7 +39,6 @@ When creating new PNG thumbnail, add comment "SourceFile: <imagePath>" to the PN
 #include <string>
 #include <unordered_map>
 #include <vector>
-
 
 namespace fs = std::filesystem;
 using json = nlohmann::json;
@@ -92,9 +92,11 @@ struct KeyedToken {
 
 struct FileSnapshot {
     fs::path absolutePath;
+    fs::path absoluteDirectoryPath;
     std::string directoryKey;
     std::string basename;
     std::int64_t mtime = 0;
+    std::int64_t directoryMtime = 0;
     std::int64_t size = 0;
 };
 
@@ -165,11 +167,20 @@ std::optional<FileSnapshot> snapshotFile(const fs::path &imagePath) {
         return std::nullopt;
     }
 
+    fs::path absoluteDirectoryPath = absolutePath.parent_path().lexically_normal();
+    auto directoryTime = fs::last_write_time(absoluteDirectoryPath, ec);
+    if (ec) {
+        // Fallback to file mtime if directory mtime cannot be read.
+        directoryTime = fileTime;
+    }
+
     FileSnapshot snapshot;
     snapshot.absolutePath = absolutePath.lexically_normal();
-    snapshot.directoryKey = directoryKeyForPath(snapshot.absolutePath.parent_path());
+    snapshot.absoluteDirectoryPath = absoluteDirectoryPath;
+    snapshot.directoryKey = directoryKeyForPath(snapshot.absoluteDirectoryPath);
     snapshot.basename = snapshot.absolutePath.filename().string();
     snapshot.mtime = fileTimeToEpochSeconds(fileTime);
+    snapshot.directoryMtime = fileTimeToEpochSeconds(directoryTime);
     snapshot.size = static_cast<std::int64_t>(fileSize);
     return snapshot;
 }
@@ -196,6 +207,8 @@ bool openDatabase(const fs::path &databasePath, sqlite3 **db, std::string &error
         return false;
     }
 
+    sql::enableTrace(*db);
+
     char *execError = nullptr;
     if (sql::exec(*db, "PRAGMA foreign_keys = ON;", &execError) != SQLITE_OK) {
         errorMessage = execError != nullptr ? execError : sqlite3_errmsg(*db);
@@ -211,7 +224,6 @@ bool openDatabase(const fs::path &databasePath, sqlite3 **db, std::string &error
 }
 
 bool execSql(sqlite3 *db, const char *sql, std::string &errorMessage) {
-    logSqlStatement(sql);
     char *execError = nullptr;
     if (sql::exec(db, sql, &execError) != SQLITE_OK) {
         errorMessage = execError != nullptr ? execError : sqlite3_errmsg(db);
@@ -914,6 +926,10 @@ fs::path defaultMetadataCacheFile(const fs::path &baseCacheDir) {
     return baseCacheDir / "metadata.sqlite";
 }
 
+bool openMetadataCacheDatabase(const fs::path &databasePath, sqlite3 **db, std::string &errorMessage) {
+    return openDatabase(databasePath, db, errorMessage);
+}
+
 bool initializeMetadataCache(const fs::path &databasePath, std::string &errorMessage) {
     errorMessage.clear();
 
@@ -943,37 +959,182 @@ bool initializeMetadataCache(const fs::path &databasePath, std::string &errorMes
     return true;
 }
 
-bool loadMetadataBatch(const fs::path &databasePath, const std::vector<fs::path> &imagePaths,
-                       MetadataByPath &cachedMetadata, std::vector<fs::path> &missingPaths,
-                       std::string &errorMessage, SourceSnapshotByPath *sourceSnapshots) {
+bool loadDirectoryMtimesBatch(sqlite3 *db, const std::vector<fs::path> &directories,
+                              std::map<fs::path, std::int64_t> &directoryMtimes, std::string &errorMessage) {
+    directoryMtimes.clear();
+    errorMessage.clear();
+
+    if (!db) {
+        errorMessage = "metadata cache database is null";
+        return false;
+    }
+
+    if (directories.empty()) {
+        return true;
+    }
+
+    const char *selectSql = "SELECT name, mtime FROM dir;";
+    sqlite3_stmt *stmt = nullptr;
+    if (sql::prepare(db, selectSql, &stmt) != SQLITE_OK) {
+        errorMessage = sqlite3_errmsg(db);
+        return false;
+    }
+
+    std::unordered_map<std::string, std::int64_t> cachedByKey;
+    while (true) {
+        int rc = sqlite3_step(stmt);
+        if (rc == SQLITE_DONE) {
+            break;
+        }
+        if (rc != SQLITE_ROW) {
+            errorMessage = sqlite3_errmsg(db);
+            sqlite3_finalize(stmt);
+            directoryMtimes.clear();
+            return false;
+        }
+
+        const unsigned char *key = sqlite3_column_text(stmt, 0);
+        if (key == nullptr) {
+            continue;
+        }
+        cachedByKey[reinterpret_cast<const char *>(key)] = sqlite3_column_int64(stmt, 1);
+    }
+
+    sqlite3_reset(stmt);
+
+    for (const auto &directory : directories) {
+        std::error_code ec;
+        fs::path absoluteDirectory = fs::absolute(directory, ec);
+        if (ec) {
+            continue;
+        }
+        absoluteDirectory = absoluteDirectory.lexically_normal();
+
+        std::string directoryKey = directoryKeyForPath(absoluteDirectory);
+        auto it = cachedByKey.find(directoryKey);
+        if (it != cachedByKey.end()) {
+            directoryMtimes[absoluteDirectory] = it->second;
+        }
+    }
+
+    sqlite3_finalize(stmt);
+    return true;
+}
+
+bool loadDirectoryMtimesBatch(const fs::path &databasePath, const std::vector<fs::path> &directories,
+                              std::map<fs::path, std::int64_t> &directoryMtimes, std::string &errorMessage) {
+    sqlite3 *db = nullptr;
+    if (!openMetadataCacheDatabase(databasePath, &db, errorMessage)) {
+        return false;
+    }
+    const bool ok = loadDirectoryMtimesBatch(db, directories, directoryMtimes, errorMessage);
+    sqlite3_close(db);
+    return ok;
+}
+
+bool storeDirectoryMtimesBatch(sqlite3 *db, const std::map<fs::path, std::int64_t> &directoryMtimes,
+                               std::string &errorMessage) {
+    errorMessage.clear();
+    if (!db) {
+        errorMessage = "metadata cache database is null";
+        return false;
+    }
+
+    if (directoryMtimes.empty()) {
+        return true;
+    }
+
+    if (!execSql(db, "BEGIN IMMEDIATE TRANSACTION;", errorMessage)) {
+        return false;
+    }
+
+    const char *upsertSql = "INSERT INTO dir(name, mtime) VALUES(?1, ?2) "
+                            "ON CONFLICT(name) DO UPDATE SET mtime = excluded.mtime;";
+
+    sqlite3_stmt *stmt = nullptr;
+    if (sql::prepare(db, upsertSql, &stmt) != SQLITE_OK) {
+        std::string rollbackError;
+        execSql(db, "ROLLBACK;", rollbackError);
+        errorMessage = sqlite3_errmsg(db);
+        return false;
+    }
+
+    for (const auto &[directory, mtime] : directoryMtimes) {
+        std::error_code ec;
+        fs::path absoluteDirectory = fs::absolute(directory, ec);
+        if (ec) {
+            continue;
+        }
+        absoluteDirectory = absoluteDirectory.lexically_normal();
+        std::string directoryKey = directoryKeyForPath(absoluteDirectory);
+
+        sqlite3_reset(stmt);
+        sqlite3_clear_bindings(stmt);
+        sqlite3_bind_text(stmt, 1, directoryKey.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_int64(stmt, 2, mtime);
+
+        if (sqlite3_step(stmt) != SQLITE_DONE) {
+            std::string rollbackError;
+            execSql(db, "ROLLBACK;", rollbackError);
+            errorMessage = sqlite3_errmsg(db);
+            sqlite3_finalize(stmt);
+            return false;
+        }
+    }
+
+    sqlite3_finalize(stmt);
+    if (!execSql(db, "COMMIT;", errorMessage)) {
+        std::string rollbackError;
+        execSql(db, "ROLLBACK;", rollbackError);
+        return false;
+    }
+
+    return true;
+}
+
+bool storeDirectoryMtimesBatch(const fs::path &databasePath, const std::map<fs::path, std::int64_t> &directoryMtimes,
+                               std::string &errorMessage) {
+    sqlite3 *db = nullptr;
+    if (!openMetadataCacheDatabase(databasePath, &db, errorMessage)) {
+        return false;
+    }
+    const bool ok = storeDirectoryMtimesBatch(db, directoryMtimes, errorMessage);
+    sqlite3_close(db);
+    return ok;
+}
+
+bool loadMetadataBatch(sqlite3 *db, const std::vector<fs::path> &imagePaths, MetadataByPath &cachedMetadata,
+                       std::vector<fs::path> &missingPaths, std::string &errorMessage,
+                       SourceSnapshotByPath *sourceSnapshots) {
     cachedMetadata.clear();
     missingPaths.clear();
     errorMessage.clear();
+
+    if (!db) {
+        errorMessage = "metadata cache database is null";
+        missingPaths = imagePaths;
+        return false;
+    }
 
     if (sourceSnapshots) {
         sourceSnapshots->clear();
     }
 
-    sqlite3 *db = nullptr;
-    if (!openDatabase(databasePath, &db, errorMessage)) {
-        missingPaths = imagePaths;
-        return false;
-    }
-
-    const char *selectSql = "SELECT f.mtime, f.size, f.checked, c.width, c.height, c.latitude, c.longitude, d.name, "
-                            "f.basename, c.data "
+    const char *selectSql = "SELECT f.basename, f.mtime, f.size, f.checked, c.width, c.height, c.latitude, "
+                            "c.longitude, c.data "
                             "FROM dir d "
                             "JOIN file f ON f.dir_id = d.id "
                             "JOIN content c ON c.file_id = f.id "
-                            "WHERE d.name = ?1 AND f.basename = ?2 LIMIT 1;";
+                            "WHERE d.name = ?1;";
 
     sqlite3_stmt *stmt = nullptr;
     if (sql::prepare(db, selectSql, &stmt) != SQLITE_OK) {
         errorMessage = sqlite3_errmsg(db);
-        sqlite3_close(db);
         missingPaths = imagePaths;
         return false;
     }
+
+    std::map<std::string, std::vector<FileSnapshot>> snapshotsByDirectory;
 
     for (const auto &imagePath : imagePaths) {
         auto snapshot = snapshotFile(imagePath);
@@ -986,79 +1147,139 @@ bool loadMetadataBatch(const fs::path &databasePath, const std::vector<fs::path>
             (*sourceSnapshots)[snapshot->absolutePath] = {snapshot->mtime, snapshot->size};
         }
 
-        auto stored = fetchStoredRow(stmt, *snapshot, errorMessage);
-        if (!errorMessage.empty()) {
-            sqlite3_finalize(stmt);
-            sqlite3_close(db);
-            cachedMetadata.clear();
-            missingPaths = imagePaths;
-            return false;
-        }
+        snapshotsByDirectory[snapshot->directoryKey].push_back(*snapshot);
+    }
 
-        if (!stored.has_value() || std::llabs(stored->mtime - snapshot->mtime) > kMtimeToleranceSeconds ||
-            stored->size != snapshot->size || !isFresh(snapshot->absolutePath, stored->checked)) {
-            missingPaths.push_back(snapshot->absolutePath);
-            continue;
-        }
+    for (const auto &[directoryKey, directorySnapshots] : snapshotsByDirectory) {
+        sqlite3_reset(stmt);
+        sqlite3_clear_bindings(stmt);
+        sqlite3_bind_text(stmt, 1, directoryKey.c_str(), -1, SQLITE_TRANSIENT);
 
-        try {
-            json metadata = json::parse(stored->data);
-            if (!metadata.is_object()) {
-                throw std::runtime_error("cached metadata is not an object");
+        std::unordered_map<std::string, StoredMetadataRow> storedByBasename;
+        while (true) {
+            int rc = sqlite3_step(stmt);
+            if (rc == SQLITE_DONE) {
+                break;
+            }
+            if (rc != SQLITE_ROW) {
+                errorMessage = sqlite3_errmsg(db);
+                sqlite3_finalize(stmt);
+                cachedMetadata.clear();
+                missingPaths = imagePaths;
+                return false;
             }
 
-            if (hasSuspiciousCreatorText(metadata)) {
-                missingPaths.push_back(snapshot->absolutePath);
+            const unsigned char *basenameText = sqlite3_column_text(stmt, 0);
+            if (basenameText == nullptr) {
                 continue;
             }
 
-            metadata["SourceFile"] = snapshot->absolutePath.string();
-            if (stored->hasLatitude) {
-                metadata["GPSLatitude"] = stored->latitude;
-            }
-            if (stored->hasLongitude) {
-                metadata["GPSLongitude"] = stored->longitude;
+            StoredMetadataRow row;
+            row.mtime = sqlite3_column_int64(stmt, 1);
+            row.size = sqlite3_column_int64(stmt, 2);
+            row.checked = sqlite3_column_int64(stmt, 3);
+            row.width = sqlite3_column_int(stmt, 4);
+            row.height = sqlite3_column_int(stmt, 5);
+
+            const auto latitudeType = sqlite3_column_type(stmt, 6);
+            row.hasLatitude = latitudeType != SQLITE_NULL;
+            if (row.hasLatitude) {
+                row.latitude = sqlite3_column_double(stmt, 6);
             }
 
-            if (stored->width > 0) {
-                metadata["width"] = stored->width;
-            }
-            if (stored->height > 0) {
-                metadata["height"] = stored->height;
+            const auto longitudeType = sqlite3_column_type(stmt, 7);
+            row.hasLongitude = longitudeType != SQLITE_NULL;
+            if (row.hasLongitude) {
+                row.longitude = sqlite3_column_double(stmt, 7);
             }
 
-            cachedMetadata[snapshot->absolutePath] = std::move(metadata);
-        } catch (...) {
-            missingPaths.push_back(snapshot->absolutePath);
+            const unsigned char *data = sqlite3_column_text(stmt, 8);
+            row.data = data != nullptr ? reinterpret_cast<const char *>(data) : "{}";
+
+            storedByBasename[reinterpret_cast<const char *>(basenameText)] = std::move(row);
+        }
+
+        for (const auto &snapshot : directorySnapshots) {
+            auto storedIt = storedByBasename.find(snapshot.basename);
+            if (storedIt == storedByBasename.end()) {
+                missingPaths.push_back(snapshot.absolutePath);
+                continue;
+            }
+
+            const StoredMetadataRow &stored = storedIt->second;
+            if (std::llabs(stored.mtime - snapshot.mtime) > kMtimeToleranceSeconds || stored.size != snapshot.size ||
+                !isFresh(snapshot.absolutePath, stored.checked)) {
+                missingPaths.push_back(snapshot.absolutePath);
+                continue;
+            }
+
+            try {
+                json metadata = json::parse(stored.data);
+                if (!metadata.is_object()) {
+                    throw std::runtime_error("cached metadata is not an object");
+                }
+
+                if (hasSuspiciousCreatorText(metadata)) {
+                    missingPaths.push_back(snapshot.absolutePath);
+                    continue;
+                }
+
+                metadata["SourceFile"] = snapshot.absolutePath.string();
+                if (stored.hasLatitude) {
+                    metadata["GPSLatitude"] = stored.latitude;
+                }
+                if (stored.hasLongitude) {
+                    metadata["GPSLongitude"] = stored.longitude;
+                }
+
+                if (stored.width > 0) {
+                    metadata["width"] = stored.width;
+                }
+                if (stored.height > 0) {
+                    metadata["height"] = stored.height;
+                }
+
+                cachedMetadata[snapshot.absolutePath] = std::move(metadata);
+            } catch (...) {
+                missingPaths.push_back(snapshot.absolutePath);
+            }
         }
     }
 
     sqlite3_finalize(stmt);
-    sqlite3_close(db);
     return true;
 }
 
-bool deleteMetadataBatch(const fs::path &databasePath, const std::vector<fs::path> &imagePaths,
-                         std::string &errorMessage) {
+bool loadMetadataBatch(const fs::path &databasePath, const std::vector<fs::path> &imagePaths,
+                       MetadataByPath &cachedMetadata, std::vector<fs::path> &missingPaths, std::string &errorMessage,
+                       SourceSnapshotByPath *sourceSnapshots) {
+    sqlite3 *db = nullptr;
+    if (!openMetadataCacheDatabase(databasePath, &db, errorMessage)) {
+        missingPaths = imagePaths;
+        return false;
+    }
+    const bool ok = loadMetadataBatch(db, imagePaths, cachedMetadata, missingPaths, errorMessage, sourceSnapshots);
+    sqlite3_close(db);
+    return ok;
+}
+
+bool deleteMetadataBatch(sqlite3 *db, const std::vector<fs::path> &imagePaths, std::string &errorMessage) {
     errorMessage.clear();
+    if (!db) {
+        errorMessage = "metadata cache database is null";
+        return false;
+    }
+
     if (imagePaths.empty()) {
         return true;
     }
 
-    sqlite3 *db = nullptr;
-    if (!openDatabase(databasePath, &db, errorMessage)) {
-        return false;
-    }
-    if (!execSql(db, cacheSchemaSql().c_str(), errorMessage)) {
-        sqlite3_close(db);
-        return false;
-    }
     if (!execSql(db, "BEGIN IMMEDIATE TRANSACTION;", errorMessage)) {
-        sqlite3_close(db);
         return false;
     }
 
-    const char *selectFileIdSql = "SELECT f.id FROM dir d JOIN file f ON f.dir_id = d.id WHERE d.name = ?1 AND f.basename = ?2 LIMIT 1;";
+    const char *selectFileIdSql =
+        "SELECT f.id FROM dir d JOIN file f ON f.dir_id = d.id WHERE d.name = ?1 AND f.basename = ?2 LIMIT 1;";
     const char *deleteFileSql = "DELETE FROM file WHERE id = ?1;";
     const char *deleteUnusedTokensSql =
         "DELETE FROM token WHERE id NOT IN (SELECT DISTINCT token_id FROM content_token);";
@@ -1082,7 +1303,6 @@ bool deleteMetadataBatch(const fs::path &databasePath, const std::vector<fs::pat
             sqlite3_finalize(deleteDanglingTokenWords);
         if (deleteUnusedWords)
             sqlite3_finalize(deleteUnusedWords);
-        sqlite3_close(db);
     };
 
     auto fail = [&](const std::string &message) {
@@ -1147,23 +1367,29 @@ bool deleteMetadataBatch(const fs::path &databasePath, const std::vector<fs::pat
     return true;
 }
 
-bool storeMetadataBatch(const fs::path &databasePath, const MetadataByPath &metadataByPath,
-                        std::string &errorMessage) {
+bool deleteMetadataBatch(const fs::path &databasePath, const std::vector<fs::path> &imagePaths,
+                         std::string &errorMessage) {
+    sqlite3 *db = nullptr;
+    if (!openMetadataCacheDatabase(databasePath, &db, errorMessage)) {
+        return false;
+    }
+    const bool ok = deleteMetadataBatch(db, imagePaths, errorMessage);
+    sqlite3_close(db);
+    return ok;
+}
+
+bool storeMetadataBatch(sqlite3 *db, const MetadataByPath &metadataByPath, std::string &errorMessage) {
     errorMessage.clear();
+    if (!db) {
+        errorMessage = "metadata cache database is null";
+        return false;
+    }
+
     if (metadataByPath.empty()) {
         return true;
     }
 
-    sqlite3 *db = nullptr;
-    if (!openDatabase(databasePath, &db, errorMessage)) {
-        return false;
-    }
-    if (!execSql(db, cacheSchemaSql().c_str(), errorMessage)) {
-        sqlite3_close(db);
-        return false;
-    }
     if (!execSql(db, "BEGIN IMMEDIATE TRANSACTION;", errorMessage)) {
-        sqlite3_close(db);
         return false;
     }
 
@@ -1187,13 +1413,11 @@ bool storeMetadataBatch(const fs::path &databasePath, const MetadataByPath &meta
     const char *deleteDanglingTokenWordsSql = "DELETE FROM token_word WHERE token_id NOT IN (SELECT id FROM token);";
     const char *deleteUnusedWordsSql = "DELETE FROM word WHERE id NOT IN (SELECT DISTINCT word_id FROM token_word);";
     const char *upsertTokenSql = "INSERT INTO token(name) VALUES(?1) ON CONFLICT(name) DO NOTHING;";
-    const char *selectTokenIdSql = "SELECT id FROM token WHERE name = ?1;";
     const char *insertContentTokenSql =
         "INSERT OR IGNORE INTO content_token(content_id, fts_key_id, token_id) VALUES(?1, ?2, ?3);";
     const char *upsertWordSql =
         "INSERT INTO word(name, simple) VALUES(?1, ?2) ON CONFLICT(name) DO UPDATE SET simple = "
         "excluded.simple;";
-    const char *selectWordIdSql = "SELECT id FROM word WHERE name = ?1;";
     const char *insertTokenWordSql = "INSERT OR IGNORE INTO token_word(token_id, word_id) VALUES(?1, ?2);";
 
     sqlite3_stmt *upsertDir = nullptr;
@@ -1208,10 +1432,8 @@ bool storeMetadataBatch(const fs::path &databasePath, const MetadataByPath &meta
     sqlite3_stmt *deleteDanglingTokenWords = nullptr;
     sqlite3_stmt *deleteUnusedWords = nullptr;
     sqlite3_stmt *upsertToken = nullptr;
-    sqlite3_stmt *selectTokenId = nullptr;
     sqlite3_stmt *insertContentToken = nullptr;
     sqlite3_stmt *upsertWord = nullptr;
-    sqlite3_stmt *selectWordId = nullptr;
     sqlite3_stmt *insertTokenWord = nullptr;
 
     auto cleanup = [&]() {
@@ -1239,17 +1461,12 @@ bool storeMetadataBatch(const fs::path &databasePath, const MetadataByPath &meta
             sqlite3_finalize(deleteUnusedWords);
         if (upsertToken)
             sqlite3_finalize(upsertToken);
-        if (selectTokenId)
-            sqlite3_finalize(selectTokenId);
         if (insertContentToken)
             sqlite3_finalize(insertContentToken);
         if (upsertWord)
             sqlite3_finalize(upsertWord);
-        if (selectWordId)
-            sqlite3_finalize(selectWordId);
         if (insertTokenWord)
             sqlite3_finalize(insertTokenWord);
-        sqlite3_close(db);
     };
 
     auto fail = [&](const std::string &message) {
@@ -1272,10 +1489,8 @@ bool storeMetadataBatch(const fs::path &databasePath, const MetadataByPath &meta
         sql::prepare(db, deleteDanglingTokenWordsSql, &deleteDanglingTokenWords) != SQLITE_OK ||
         sql::prepare(db, deleteUnusedWordsSql, &deleteUnusedWords) != SQLITE_OK ||
         sql::prepare(db, upsertTokenSql, &upsertToken) != SQLITE_OK ||
-        sql::prepare(db, selectTokenIdSql, &selectTokenId) != SQLITE_OK ||
         sql::prepare(db, insertContentTokenSql, &insertContentToken) != SQLITE_OK ||
         sql::prepare(db, upsertWordSql, &upsertWord) != SQLITE_OK ||
-        sql::prepare(db, selectWordIdSql, &selectWordId) != SQLITE_OK ||
         sql::prepare(db, insertTokenWordSql, &insertTokenWord) != SQLITE_OK) {
         return fail(sqlite3_errmsg(db));
     }
@@ -1289,6 +1504,38 @@ bool storeMetadataBatch(const fs::path &databasePath, const MetadataByPath &meta
         }
     }
     sqlite3_reset(selectFtsKeys);
+
+    std::unordered_map<std::string, sqlite3_int64> tokenIds;
+    {
+        sqlite3_stmt *selectTokens = nullptr;
+        if (sql::prepare(db, "SELECT id, name FROM token;", &selectTokens) != SQLITE_OK) {
+            return fail(sqlite3_errmsg(db));
+        }
+        while (sqlite3_step(selectTokens) == SQLITE_ROW) {
+            const sqlite3_int64 id = sqlite3_column_int64(selectTokens, 0);
+            const unsigned char *name = sqlite3_column_text(selectTokens, 1);
+            if (name != nullptr) {
+                tokenIds[reinterpret_cast<const char *>(name)] = id;
+            }
+        }
+        sqlite3_finalize(selectTokens);
+    }
+
+    std::unordered_map<std::string, sqlite3_int64> wordIds;
+    {
+        sqlite3_stmt *selectWords = nullptr;
+        if (sql::prepare(db, "SELECT id, name FROM word;", &selectWords) != SQLITE_OK) {
+            return fail(sqlite3_errmsg(db));
+        }
+        while (sqlite3_step(selectWords) == SQLITE_ROW) {
+            const sqlite3_int64 id = sqlite3_column_int64(selectWords, 0);
+            const unsigned char *name = sqlite3_column_text(selectWords, 1);
+            if (name != nullptr) {
+                wordIds[reinterpret_cast<const char *>(name)] = id;
+            }
+        }
+        sqlite3_finalize(selectWords);
+    }
 
     const std::int64_t checkedNow = nowEpochSeconds();
     for (const auto &[imagePath, metadata] : metadataByPath) {
@@ -1312,7 +1559,7 @@ bool storeMetadataBatch(const fs::path &databasePath, const MetadataByPath &meta
         sqlite3_reset(upsertDir);
         sqlite3_clear_bindings(upsertDir);
         sqlite3_bind_text(upsertDir, 1, snapshot->directoryKey.c_str(), -1, SQLITE_TRANSIENT);
-        sqlite3_bind_int64(upsertDir, 2, snapshot->mtime);
+        sqlite3_bind_int64(upsertDir, 2, snapshot->directoryMtime);
         if (sqlite3_step(upsertDir) != SQLITE_DONE) {
             return fail(sqlite3_errmsg(db));
         }
@@ -1392,21 +1639,6 @@ bool storeMetadataBatch(const fs::path &databasePath, const MetadataByPath &meta
             return fail(sqlite3_errmsg(db));
         }
 
-        sqlite3_reset(deleteUnusedTokens);
-        if (sqlite3_step(deleteUnusedTokens) != SQLITE_DONE) {
-            return fail(sqlite3_errmsg(db));
-        }
-
-        sqlite3_reset(deleteDanglingTokenWords);
-        if (sqlite3_step(deleteDanglingTokenWords) != SQLITE_DONE) {
-            return fail(sqlite3_errmsg(db));
-        }
-
-        sqlite3_reset(deleteUnusedWords);
-        if (sqlite3_step(deleteUnusedWords) != SQLITE_DONE) {
-            return fail(sqlite3_errmsg(db));
-        }
-
         const std::vector<KeyedToken> keyedTokens = generateFtsTokens(ftsPrepared);
         for (const auto &keyedToken : keyedTokens) {
             const auto keyIt = ftsKeyIds.find(keyedToken.key);
@@ -1421,13 +1653,17 @@ bool storeMetadataBatch(const fs::path &databasePath, const MetadataByPath &meta
                 return fail(sqlite3_errmsg(db));
             }
 
-            sqlite3_reset(selectTokenId);
-            sqlite3_clear_bindings(selectTokenId);
-            sqlite3_bind_text(selectTokenId, 1, keyedToken.token.c_str(), -1, SQLITE_TRANSIENT);
-            if (sqlite3_step(selectTokenId) != SQLITE_ROW) {
-                return fail(sqlite3_errmsg(db));
+            sqlite3_int64 tokenId = 0;
+            auto tokenIt = tokenIds.find(keyedToken.token);
+            if (tokenIt != tokenIds.end()) {
+                tokenId = tokenIt->second;
+            } else {
+                tokenId = sqlite3_last_insert_rowid(db);
+                if (tokenId <= 0) {
+                    return fail("failed to resolve token id for newly inserted token");
+                }
+                tokenIds[keyedToken.token] = tokenId;
             }
-            const sqlite3_int64 tokenId = sqlite3_column_int64(selectTokenId, 0);
 
             sqlite3_reset(insertContentToken);
             sqlite3_clear_bindings(insertContentToken);
@@ -1457,13 +1693,17 @@ bool storeMetadataBatch(const fs::path &databasePath, const MetadataByPath &meta
                     return fail(sqlite3_errmsg(db));
                 }
 
-                sqlite3_reset(selectWordId);
-                sqlite3_clear_bindings(selectWordId);
-                sqlite3_bind_text(selectWordId, 1, word.c_str(), -1, SQLITE_TRANSIENT);
-                if (sqlite3_step(selectWordId) != SQLITE_ROW) {
-                    return fail(sqlite3_errmsg(db));
+                sqlite3_int64 wordId = 0;
+                auto wordIt = wordIds.find(word);
+                if (wordIt != wordIds.end()) {
+                    wordId = wordIt->second;
+                } else {
+                    wordId = sqlite3_last_insert_rowid(db);
+                    if (wordId <= 0) {
+                        return fail("failed to resolve word id for newly inserted word");
+                    }
+                    wordIds[word] = wordId;
                 }
-                const sqlite3_int64 wordId = sqlite3_column_int64(selectWordId, 0);
 
                 sqlite3_reset(insertTokenWord);
                 sqlite3_clear_bindings(insertTokenWord);
@@ -1496,6 +1736,17 @@ bool storeMetadataBatch(const fs::path &databasePath, const MetadataByPath &meta
 
     cleanup();
     return true;
+}
+
+bool storeMetadataBatch(const fs::path &databasePath, const MetadataByPath &metadataByPath,
+                        std::string &errorMessage) {
+    sqlite3 *db = nullptr;
+    if (!openMetadataCacheDatabase(databasePath, &db, errorMessage)) {
+        return false;
+    }
+    const bool ok = storeMetadataBatch(db, metadataByPath, errorMessage);
+    sqlite3_close(db);
+    return ok;
 }
 
 json stripTransientMetadata(json metadata) {

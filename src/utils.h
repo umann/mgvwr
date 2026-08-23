@@ -2,11 +2,10 @@
 
 #include <filesystem>
 #include <iostream>
-#include <sstream>
 #include <sqlite3.h>
+#include <sstream>
 #include <string>
 #include <vector>
-
 
 namespace fs = std::filesystem;
 
@@ -78,10 +77,11 @@ std::string sqliteValueToYamlString(sqlite3_stmt *stmt, int columnIndex);
 
 // Centralized SQL abstraction used by all database components.
 namespace sql {
+void enableTrace(sqlite3 *db);
 int prepare(sqlite3 *db, const char *sql, sqlite3_stmt **stmt);
 int exec(sqlite3 *db, const char *sql, char **errmsg);
 int step(sqlite3_stmt *stmt, std::string &firstRow, int &rowCount);
-}
+} // namespace sql
 
 // Log a SQL statement in one line.
 void logSqlStatement(const std::string &sql);
