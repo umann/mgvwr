@@ -374,33 +374,33 @@ std::string collapseSqlWhitespace(const std::string &sql) {
 std::string sqliteValueToYamlString(sqlite3_stmt *stmt, int columnIndex) {
     const int type = sqlite3_column_type(stmt, columnIndex);
     switch (type) {
-        case SQLITE_INTEGER: {
-            return std::to_string(sqlite3_column_int64(stmt, columnIndex));
-        }
-        case SQLITE_FLOAT: {
-            std::ostringstream oss;
-            oss << sqlite3_column_double(stmt, columnIndex);
-            return oss.str();
-        }
-        case SQLITE_TEXT: {
-            const unsigned char *text = sqlite3_column_text(stmt, columnIndex);
-            std::string value = text ? reinterpret_cast<const char *>(text) : "";
-            std::string escaped;
-            escaped.reserve(value.size() + 2);
-            for (unsigned char ch : value) {
-                if (ch == '\\' || ch == '"') {
-                    escaped.push_back('\\');
-                }
-                escaped.push_back(static_cast<char>(ch));
+    case SQLITE_INTEGER: {
+        return std::to_string(sqlite3_column_int64(stmt, columnIndex));
+    }
+    case SQLITE_FLOAT: {
+        std::ostringstream oss;
+        oss << sqlite3_column_double(stmt, columnIndex);
+        return oss.str();
+    }
+    case SQLITE_TEXT: {
+        const unsigned char *text = sqlite3_column_text(stmt, columnIndex);
+        std::string value = text ? reinterpret_cast<const char *>(text) : "";
+        std::string escaped;
+        escaped.reserve(value.size() + 2);
+        for (unsigned char ch : value) {
+            if (ch == '\\' || ch == '"') {
+                escaped.push_back('\\');
             }
-            return std::string("\"") + escaped + "\"";
+            escaped.push_back(static_cast<char>(ch));
         }
-        case SQLITE_NULL:
-            return "null";
-        case SQLITE_BLOB:
-            return "<blob>";
-        default:
-            return "null";
+        return std::string("\"") + escaped + "\"";
+    }
+    case SQLITE_NULL:
+        return "null";
+    case SQLITE_BLOB:
+        return "<blob>";
+    default:
+        return "null";
     }
 }
 
@@ -409,13 +409,40 @@ void logSqlStatement(const std::string &sql) {
 }
 
 namespace sql {
+namespace {
+
+int sqliteTraceCallback(unsigned, void *, void *pStmt, void *pSql) {
+    const char *fallbackSql = static_cast<const char *>(pSql);
+    sqlite3_stmt *stmt = static_cast<sqlite3_stmt *>(pStmt);
+
+    char *expanded = stmt ? sqlite3_expanded_sql(stmt) : nullptr;
+    const std::string sqlText =
+        expanded ? std::string(expanded) : (fallbackSql ? std::string(fallbackSql) : std::string());
+    if (expanded) {
+        sqlite3_free(expanded);
+    }
+
+    if (!sqlText.empty()) {
+        logSqlStatement(sqlText);
+    }
+
+    return 0;
+}
+
+} // namespace
+
+void enableTrace(sqlite3 *db) {
+    if (!db) {
+        return;
+    }
+    sqlite3_trace_v2(db, SQLITE_TRACE_STMT, sqliteTraceCallback, nullptr);
+}
+
 int prepare(sqlite3 *db, const char *sql, sqlite3_stmt **stmt) {
-    logSqlStatement(sql);
     return sqlite3_prepare_v2(db, sql, -1, stmt, nullptr);
 }
 
 int exec(sqlite3 *db, const char *sql, char **errmsg) {
-    logSqlStatement(sql);
     return sqlite3_exec(db, sql, nullptr, nullptr, errmsg);
 }
 
@@ -440,7 +467,7 @@ int step(sqlite3_stmt *stmt, std::string &firstRow, int &rowCount) {
     }
     return rc;
 }
-}
+} // namespace sql
 
 void logSqlSelectResult(const std::string &sql, sqlite3_stmt *stmt) {
     logSqlStatement(sql);

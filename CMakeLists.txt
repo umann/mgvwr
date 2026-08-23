@@ -8,19 +8,16 @@ set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
-# Add nlohmann/json header-only library
-# Download the single header file if not present
-if(NOT EXISTS "${CMAKE_SOURCE_DIR}/src/json.hpp")
-    message(STATUS "Downloading nlohmann/json...")
-    file(DOWNLOAD 
-        "https://github.com/nlohmann/json/releases/download/v3.11.2/json.hpp"
-        "${CMAKE_SOURCE_DIR}/src/json.hpp"
-        SHOW_PROGRESS
-    )
-endif()
+# Fetch nlohmann/json for JSON parsing and schema validation
+include(FetchContent)
+FetchContent_Declare(
+    nlohmann_json
+    URL https://github.com/nlohmann/json/archive/refs/tags/v3.11.2.tar.gz
+    DOWNLOAD_EXTRACT_TIMESTAMP TRUE
+)
+FetchContent_MakeAvailable(nlohmann_json)
 
 # Fetch yaml-cpp for YAML configuration parsing
-include(FetchContent)
 FetchContent_Declare(
     yaml-cpp
     URL https://github.com/jbeder/yaml-cpp/archive/refs/tags/0.8.0.tar.gz
@@ -36,7 +33,13 @@ if (TARGET yaml-cpp)
     )
 endif()
 
-# Fetch inja for template rendering
+# Fetch inja for template rendering. Reuse the project nlohmann_json target
+# instead of letting Inja create its own duplicate interface target.
+# Keep this dependency minimal for the app build; the upstream test suite is not needed here.
+set(INJA_USE_EMBEDDED_JSON OFF CACHE BOOL "Use external nlohmann_json" FORCE)
+set(BUILD_TESTING OFF CACHE BOOL "Disable external test targets" FORCE)
+set(INJA_BUILD_TESTS OFF CACHE BOOL "Disable Inja unit tests" FORCE)
+set(BUILD_BENCHMARK OFF CACHE BOOL "Disable Inja benchmarks" FORCE)
 FetchContent_Declare(
     inja
     URL https://github.com/pantor/inja/archive/refs/tags/v3.4.0.tar.gz
@@ -86,6 +89,10 @@ set(MGVWR_SOURCES
     src/cli.cpp
     src/map_viewer.cpp
     src/config.cpp
+    src/schema_engine.cpp
+    src/serialize.cpp
+    src/thumbnail_cache.cpp
+    src/precache.cpp
     src/metadata.cpp
     src/metadata_cache.cpp
     src/poor_mans_exiftool.cpp
@@ -160,9 +167,9 @@ add_executable(mgvwr ${MGVWR_SOURCES})
 add_dependencies(mgvwr embed_schemas)
 
 # Link libraries
-target_link_libraries(mgvwr PRIVATE SFML::Graphics SFML::Window SFML::System SFML::Network yaml-cpp pantor::inja ${SQLITE3_LIBRARY})
+target_link_libraries(mgvwr PRIVATE SFML::Graphics SFML::Window SFML::System SFML::Network yaml-cpp pantor::inja nlohmann_json::nlohmann_json ${SQLITE3_LIBRARY})
 
-# Add include directory for json.hpp
+# Add include directories for local project headers and generated schema output
 target_include_directories(mgvwr PRIVATE "${CMAKE_SOURCE_DIR}/src" "${SQLITE3_INCLUDE_DIR}" "${MGVWR_GENERATED_DIR}")
 
 # For standalone builds, add all static dependencies AFTER SFML libraries

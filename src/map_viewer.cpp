@@ -19,6 +19,33 @@ static std::string getTimestamp() {
     return ss.str();
 }
 
+struct VisibleTileRange {
+    int minTileX = 0;
+    int maxTileX = 0;
+    int minTileY = 0;
+    int maxTileY = 0;
+};
+
+static VisibleTileRange computeVisibleTileRange(double centerPixX, double centerPixY, int zoom, int viewportWidth,
+                                                int viewportHeight) {
+    constexpr int tileSize = 256;
+    const int screenCenterX = viewportWidth / 2;
+    const int screenCenterY = viewportHeight / 2;
+
+    int minTileX = static_cast<int>((centerPixX - screenCenterX) / tileSize) - 1;
+    int maxTileX = static_cast<int>((centerPixX + screenCenterX) / tileSize) + 1;
+    int minTileY = static_cast<int>((centerPixY - screenCenterY) / tileSize) - 1;
+    int maxTileY = static_cast<int>((centerPixY + screenCenterY) / tileSize) + 1;
+
+    const int maxTileIndex = (1 << zoom) - 1;
+    minTileX = std::max(0, minTileX);
+    maxTileX = std::min(maxTileIndex, maxTileX);
+    minTileY = std::max(0, minTileY);
+    maxTileY = std::min(maxTileIndex, maxTileY);
+
+    return {minTileX, maxTileX, minTileY, maxTileY};
+}
+
 MapViewer::MapViewer(const std::string &cacheDir, size_t maxCacheSizeMB, int windowWidth, int windowHeight,
                      bool inlineMode, int minZoom, int maxZoom)
     : cacheDirectory(cacheDir), maxCacheSizeMB(maxCacheSizeMB), windowWidth(windowWidth), windowHeight(windowHeight),
@@ -45,21 +72,19 @@ void MapViewer::showMap(double latitude, double longitude, int initialZoom) {
             renderTexture = std::make_unique<sf::RenderTexture>();
         }
         if (!renderTexture->resize(sf::Vector2u(windowWidth, windowHeight))) {
-            std::cerr << "[" << getTimestamp() << "] Failed to create render texture for inline map" << std::endl;
+            std::cerr << "Failed to create render texture for inline map" << std::endl;
             return;
         }
-        std::cout << "[" << getTimestamp() << "] [Map Viewer] Opened inline at " << latitude << ", " << longitude
-                  << " zoom " << initialZoom << " (" << windowWidth << "x" << windowHeight
-                  << "), isLoadingNewLocation=1" << std::endl;
+        std::cout << "[Map Viewer] Opened inline at " << latitude << ", " << longitude << " zoom " << initialZoom
+                  << " (" << windowWidth << "x" << windowHeight << "), isLoadingNewLocation=1" << std::endl;
     } else {
         // Create window with configured size
         sf::VideoMode mode(sf::Vector2u(windowWidth, windowHeight));
         window = std::make_unique<sf::RenderWindow>(
             mode, "Map View - " + std::to_string(latitude) + ", " + std::to_string(longitude), sf::Style::Default);
         window->setFramerateLimit(60);
-        std::cout << "[" << getTimestamp() << "] [Map Viewer] Opened at " << latitude << ", " << longitude << " zoom "
-                  << initialZoom << " (" << windowWidth << "x" << windowHeight << "), isLoadingNewLocation=1"
-                  << std::endl;
+        std::cout << "[Map Viewer] Opened at " << latitude << ", " << longitude << " zoom " << initialZoom << " ("
+                  << windowWidth << "x" << windowHeight << "), isLoadingNewLocation=1" << std::endl;
     }
 
     // Mark as loading for initial display
@@ -71,9 +96,8 @@ void MapViewer::showMap(double latitude, double longitude, int initialZoom) {
     navigationRequest = 0;
     folderNavigationRequest = 0;
 
-    std::cout << "[" << getTimestamp() << "] [Map Viewer] Opened at " << latitude << ", " << longitude << " zoom "
-              << currentZoom << " (" << windowWidth << "x" << windowHeight
-              << "), isLoadingNewLocation=" << isLoadingNewLocation << std::endl;
+    std::cout << "[Map Viewer] Opened at " << latitude << ", " << longitude << " zoom " << currentZoom << " ("
+              << windowWidth << "x" << windowHeight << "), isLoadingNewLocation=" << isLoadingNewLocation << std::endl;
 }
 
 void MapViewer::updateGPS(double latitude, double longitude) {
@@ -116,7 +140,7 @@ void MapViewer::updateGPS(double latitude, double longitude) {
     tilesLoaded = 0;
     totalVisibleTiles = 1; // Reset to 1 to show loading
 
-    std::cout << "[" << getTimestamp() << "] [Map Viewer] Updated to " << latitude << ", " << longitude << std::endl;
+    std::cout << "[Map Viewer] Updated to " << latitude << ", " << longitude << std::endl;
 }
 
 void MapViewer::updateMarkerOnly(double latitude, double longitude) {
@@ -160,11 +184,11 @@ bool MapViewer::isPointVisible(double lat, double lon) const {
 void MapViewer::close() {
     if (window && window->isOpen()) {
         window->close();
-        std::cout << "[" << getTimestamp() << "] [Map Viewer] Closed" << std::endl;
+        std::cout << "[Map Viewer] Closed" << std::endl;
     }
     if (renderTexture) {
         renderTexture.reset();
-        std::cout << "[" << getTimestamp() << "] [Map Viewer] Inline mode closed" << std::endl;
+        std::cout << "[Map Viewer] Inline mode closed" << std::endl;
     }
 }
 
@@ -202,7 +226,7 @@ bool MapViewer::zoomIn() {
         tileTextures.clear();
         tilesLoaded = 0;
         zoomBoundaryMessage.clear();
-        std::cout << "[" << getTimestamp() << "] [Map Viewer] Zoom level: " << currentZoom << std::endl;
+        std::cout << "[Map Viewer] Zoom level: " << currentZoom << std::endl;
         return true;
     }
     zoomBoundaryMessage = "Maximum Zoom is " + std::to_string(maxZoom);
@@ -215,7 +239,7 @@ bool MapViewer::zoomOut() {
         tileTextures.clear();
         tilesLoaded = 0;
         zoomBoundaryMessage.clear();
-        std::cout << "[" << getTimestamp() << "] [Map Viewer] Zoom level: " << currentZoom << std::endl;
+        std::cout << "[Map Viewer] Zoom level: " << currentZoom << std::endl;
         return true;
     }
     zoomBoundaryMessage = "Minimum Zoom is " + std::to_string(minZoom);
@@ -281,7 +305,7 @@ void MapViewer::onWindowResize(int newWidth, int newHeight) {
     // Resize render texture if in inline mode
     if (inlineMode && renderTexture) {
         if (!renderTexture->resize(sf::Vector2u(newWidth, newHeight))) {
-            std::cerr << "[" << getTimestamp() << "] Failed to resize render texture" << std::endl;
+            std::cerr << "Failed to resize render texture" << std::endl;
         }
     }
 
@@ -356,15 +380,14 @@ void MapViewer::downloadTile(const TileCoord &coord) {
     int result = system(command.c_str());
 
     if (result == 0 && fs::exists(tilePath) && fs::file_size(tilePath) > 0) {
-        std::cout << "[" << getTimestamp() << "] [OSM Tile] Downloaded: " << coord.zoom << "/" << coord.x << "/"
-                  << coord.y << std::endl;
+        std::cout << "[OSM Tile] Downloaded: " << coord.zoom << "/" << coord.x << "/" << coord.y << std::endl;
+        cleanCache();
     } else {
         // Clean up failed download
         if (fs::exists(tilePath)) {
             fs::remove(tilePath);
         }
-        std::cerr << "[" << getTimestamp() << "] [OSM Tile] Failed: " << coord.zoom << "/" << coord.x << "/" << coord.y
-                  << std::endl;
+        std::cerr << "[OSM Tile] Failed: " << coord.zoom << "/" << coord.x << "/" << coord.y << std::endl;
     }
 }
 
@@ -394,16 +417,53 @@ std::shared_ptr<sf::Texture> MapViewer::loadTile(const TileCoord &coord) {
 
 void MapViewer::cleanCache() {
     size_t currentSize = getCacheSize();
-    size_t maxSize = maxCacheSizeMB * 1024 * 1024;
+    const size_t maxSize = maxCacheSizeMB * 1024 * 1024;
 
     if (currentSize <= maxSize) {
-        return; // Under limit
+        return;
     }
 
-    // TODO: Implement LRU cache cleanup
-    // For now, just log warning
-    std::cout << "Cache size " << (currentSize / 1024 / 1024) << " MB exceeds limit " << maxCacheSizeMB << " MB"
-              << std::endl;
+    std::vector<std::pair<fs::path, fs::file_time_type>> files;
+    try {
+        for (const auto &entry :
+             fs::recursive_directory_iterator(cacheDirectory, fs::directory_options::skip_permission_denied)) {
+            if (entry.is_regular_file()) {
+                files.emplace_back(entry.path(), fs::last_write_time(entry.path()));
+            }
+        }
+    } catch (const std::exception &) {
+        std::cout << "Cache size " << (currentSize / 1024 / 1024) << " MB exceeds limit " << maxCacheSizeMB << " MB"
+                  << std::endl;
+        return;
+    }
+
+    std::sort(files.begin(), files.end(), [](const auto &lhs, const auto &rhs) { return lhs.second < rhs.second; });
+
+    size_t removed = 0;
+    for (const auto &[path, _] : files) {
+        if (currentSize <= maxSize) {
+            break;
+        }
+
+        std::error_code ec;
+        const auto fileSize = fs::file_size(path, ec);
+        if (ec) {
+            continue;
+        }
+
+        if (fs::remove(path, ec) && !ec) {
+            currentSize -= fileSize;
+            ++removed;
+        }
+    }
+
+    if (removed > 0) {
+        std::cout << "[Map Viewer] Cache cleanup removed " << removed << " stale tile(s); cache now uses "
+                  << (currentSize / 1024 / 1024) << " MB" << std::endl;
+    } else {
+        std::cout << "Cache size " << (currentSize / 1024 / 1024) << " MB exceeds limit " << maxCacheSizeMB << " MB"
+                  << std::endl;
+    }
 }
 
 size_t MapViewer::getCacheSize() {
@@ -425,8 +485,7 @@ size_t MapViewer::getCacheSize() {
 void MapViewer::handleEvent(const sf::Event &event, sf::Vector2i mouseOffset) {
     // For inline mode: handle a single event with mouse position translation
     if (const auto *keyEvent = event.getIf<sf::Event::KeyPressed>()) {
-        std::cout << "[" << getTimestamp() << "] [Map Viewer] Key pressed:" << static_cast<int>(keyEvent->code)
-                  << std::endl;
+        std::cout << "[Map Viewer] Key pressed:" << static_cast<int>(keyEvent->code) << std::endl;
         switch (keyEvent->code) {
         case sf::Keyboard::Key::Escape:
             if (window)
@@ -443,14 +502,14 @@ void MapViewer::handleEvent(const sf::Event &event, sf::Vector2i mouseOffset) {
             break;
         case sf::Keyboard::Key::PageDown:
             folderNavigationRequest = 1; // Request next folder
-            std::cout << "[" << getTimestamp() << "] [Map Viewer] PageDown - next folder requested" << std::endl;
+            std::cout << "[Map Viewer] PageDown - next folder requested" << std::endl;
             break;
         case sf::Keyboard::Key::PageUp:
             folderNavigationRequest = -1; // Request previous folder
-            std::cout << "[" << getTimestamp() << "] [Map Viewer] PageUp - prev folder requested" << std::endl;
+            std::cout << "[Map Viewer] PageUp - prev folder requested" << std::endl;
             break;
         case sf::Keyboard::Key::End:
-            std::cout << "[" << getTimestamp() << "] [Map Viewer] End key pressed" << std::endl;
+            std::cout << "[Map Viewer] End key pressed" << std::endl;
             // End key - reset to marker position
             centerLat = markerLat;
             centerLon = markerLon;
@@ -469,7 +528,7 @@ void MapViewer::handleEvent(const sf::Event &event, sf::Vector2i mouseOffset) {
             }
             break;
         case sf::Keyboard::Key::Home:
-            std::cout << "[" << getTimestamp() << "] [Map Viewer] Home key pressed" << std::endl;
+            std::cout << "[Map Viewer] Home key pressed" << std::endl;
             // Reset to marker position
             centerLat = markerLat;
             centerLon = markerLon;
@@ -559,7 +618,7 @@ void MapViewer::render() {
     // Increment frame counter if loading
     if (isLoadingNewLocation) {
         framesSinceLocationChange++;
-        std::cout << "[" << getTimestamp() << "] [Map Viewer] Render frame: " << framesSinceLocationChange
+        std::cout << "[Map Viewer] Render frame: " << framesSinceLocationChange
                   << ", isLoading=" << isLoadingNewLocation << std::endl;
     }
 
@@ -599,49 +658,31 @@ void MapViewer::updateTileLoadingState() {
     double centerPixX, centerPixY;
     latLonToPixel(centerLat, centerLon, currentZoom, centerPixX, centerPixY);
 
-    // Apply view offset
     centerPixX -= viewOffset.x;
     centerPixY -= viewOffset.y;
 
-    // Calculate visible tile range
-    int screenCenterX = windowSize.x / 2;
-    int screenCenterY = windowSize.y / 2;
-
-    int minTileX = static_cast<int>((centerPixX - screenCenterX) / TILE_SIZE) - 1;
-    int maxTileX = static_cast<int>((centerPixX + screenCenterX) / TILE_SIZE) + 1;
-    int minTileY = static_cast<int>((centerPixY - screenCenterY) / TILE_SIZE) - 1;
-    int maxTileY = static_cast<int>((centerPixY + screenCenterY) / TILE_SIZE) + 1;
-
-    // Clamp to valid tile range
-    int maxTileIndex = (1 << currentZoom) - 1;
-    minTileX = std::max(0, minTileX);
-    maxTileX = std::min(maxTileIndex, maxTileX);
-    minTileY = std::max(0, minTileY);
-    maxTileY = std::min(maxTileIndex, maxTileY);
-
-    // Count total visible tiles
-    int tilesX = maxTileX - minTileX + 1;
-    int tilesY = maxTileY - minTileY + 1;
-    int newTotal = tilesX * tilesY;
+    const auto visibleTiles = computeVisibleTileRange(centerPixX, centerPixY, currentZoom, windowSize.x, windowSize.y);
+    const int tilesX = visibleTiles.maxTileX - visibleTiles.minTileX + 1;
+    const int tilesY = visibleTiles.maxTileY - visibleTiles.minTileY + 1;
+    const int newTotal = tilesX * tilesY;
 
     if (newTotal != totalVisibleTiles) {
         totalVisibleTiles = newTotal;
-        std::cout << "[" << getTimestamp() << "] [Map Viewer] Viewport: " << tilesX << "x" << tilesY << " = "
-                  << totalVisibleTiles << " tiles" << std::endl;
+        std::cout << "[Map Viewer] Viewport: " << tilesX << "x" << tilesY << " = " << totalVisibleTiles << " tiles"
+                  << std::endl;
     }
 
     tilesLoaded = 0;
 
     if (isLoadingNewLocation) {
-        std::cout << "[" << getTimestamp() << "] [Map Viewer] updateTileLoadingState: loading tiles..." << std::endl;
+        std::cout << "[Map Viewer] updateTileLoadingState: loading tiles..." << std::endl;
     }
 
     // Check if any tiles will need downloading before we start the process
     bool anyTilesToDownload = false;
-    for (int tileX = minTileX; tileX <= maxTileX; tileX++) {
-        for (int tileY = minTileY; tileY <= maxTileY; tileY++) {
+    for (int tileX = visibleTiles.minTileX; tileX <= visibleTiles.maxTileX; tileX++) {
+        for (int tileY = visibleTiles.minTileY; tileY <= visibleTiles.maxTileY; tileY++) {
             TileCoord coord{tileX, tileY, currentZoom};
-            // Check if tile needs downloading (not cached, not in memory, not attempted yet)
             if (tileTextures.find(coord) == tileTextures.end() && !isTileCached(coord) &&
                 downloadedTiles.find(coord) == downloadedTiles.end()) {
                 anyTilesToDownload = true;
@@ -658,12 +699,11 @@ void MapViewer::updateTileLoadingState() {
     }
 
     // Load tiles (synchronous downloads happen here, blocking the thread)
-    for (int tileX = minTileX; tileX <= maxTileX; tileX++) {
-        for (int tileY = minTileY; tileY <= maxTileY; tileY++) {
+    for (int tileX = visibleTiles.minTileX; tileX <= visibleTiles.maxTileX; tileX++) {
+        for (int tileY = visibleTiles.minTileY; tileY <= visibleTiles.maxTileY; tileY++) {
             TileCoord coord{tileX, tileY, currentZoom};
-            auto texture = loadTile(coord);
-            if (texture) {
-                tilesLoaded++; // Count loaded tiles
+            if (loadTile(coord)) {
+                tilesLoaded++;
             }
         }
     }
@@ -677,8 +717,8 @@ void MapViewer::updateTileLoadingState() {
     }
 
     if (isLoadingNewLocation) {
-        std::cout << "[" << getTimestamp() << "] [Map Viewer] Tiles loaded: " << tilesLoaded << "/"
-                  << totalVisibleTiles << ", framesSinceLocationChange=" << framesSinceLocationChange << std::endl;
+        std::cout << "[Map Viewer] Tiles loaded: " << tilesLoaded << "/" << totalVisibleTiles
+                  << ", framesSinceLocationChange=" << framesSinceLocationChange << std::endl;
     }
 
     // If we've loaded all tiles for the current view, mark loading as complete
@@ -686,8 +726,7 @@ void MapViewer::updateTileLoadingState() {
     if (isLoadingNewLocation && tilesLoaded >= totalVisibleTiles && totalVisibleTiles > 0 &&
         framesSinceLocationChange >= 2) {
         isLoadingNewLocation = false;
-        std::cout << "[" << getTimestamp() << "] [Map Viewer] Map tiles loaded, " << tilesLoaded << "/"
-                  << totalVisibleTiles << std::endl;
+        std::cout << "[Map Viewer] Map tiles loaded, " << tilesLoaded << "/" << totalVisibleTiles << std::endl;
     }
 }
 
@@ -696,36 +735,20 @@ void MapViewer::drawCachedTiles() {
     double centerPixX, centerPixY;
     latLonToPixel(centerLat, centerLon, currentZoom, centerPixX, centerPixY);
 
-    // Apply view offset
     centerPixX -= viewOffset.x;
     centerPixY -= viewOffset.y;
 
-    // Calculate visible tile range
-    int screenCenterX = windowSize.x / 2;
-    int screenCenterY = windowSize.y / 2;
+    const int screenCenterX = windowSize.x / 2;
+    const int screenCenterY = windowSize.y / 2;
+    const auto visibleTiles = computeVisibleTileRange(centerPixX, centerPixY, currentZoom, windowSize.x, windowSize.y);
 
-    int minTileX = static_cast<int>((centerPixX - screenCenterX) / TILE_SIZE) - 1;
-    int maxTileX = static_cast<int>((centerPixX + screenCenterX) / TILE_SIZE) + 1;
-    int minTileY = static_cast<int>((centerPixY - screenCenterY) / TILE_SIZE) - 1;
-    int maxTileY = static_cast<int>((centerPixY + screenCenterY) / TILE_SIZE) + 1;
-
-    // Clamp to valid tile range
-    int maxTileIndex = (1 << currentZoom) - 1;
-    minTileX = std::max(0, minTileX);
-    maxTileX = std::min(maxTileIndex, maxTileX);
-    minTileY = std::max(0, minTileY);
-    maxTileY = std::min(maxTileIndex, maxTileY);
-
-    // Draw cached tiles
-    for (int tileX = minTileX; tileX <= maxTileX; tileX++) {
-        for (int tileY = minTileY; tileY <= maxTileY; tileY++) {
+    for (int tileX = visibleTiles.minTileX; tileX <= visibleTiles.maxTileX; tileX++) {
+        for (int tileY = visibleTiles.minTileY; tileY <= visibleTiles.maxTileY; tileY++) {
             TileCoord coord{tileX, tileY, currentZoom};
             auto texture = getTileFromCache(coord);
 
             if (texture) {
                 sf::Sprite sprite(*texture);
-
-                // Calculate screen position
                 float screenX = screenCenterX + (tileX * TILE_SIZE - centerPixX) + viewOffset.x;
                 float screenY = screenCenterY + (tileY * TILE_SIZE - centerPixY) + viewOffset.y;
 
@@ -750,50 +773,35 @@ void MapViewer::drawTiles() {
     double centerPixX, centerPixY;
     latLonToPixel(centerLat, centerLon, currentZoom, centerPixX, centerPixY);
 
-    // Apply view offset
     centerPixX -= viewOffset.x;
     centerPixY -= viewOffset.y;
 
-    // Calculate visible tile range
-    int screenCenterX = windowSize.x / 2;
-    int screenCenterY = windowSize.y / 2;
+    const int screenCenterX = windowSize.x / 2;
+    const int screenCenterY = windowSize.y / 2;
+    const auto visibleTiles = computeVisibleTileRange(centerPixX, centerPixY, currentZoom, windowSize.x, windowSize.y);
 
-    int minTileX = static_cast<int>((centerPixX - screenCenterX) / TILE_SIZE) - 1;
-    int maxTileX = static_cast<int>((centerPixX + screenCenterX) / TILE_SIZE) + 1;
-    int minTileY = static_cast<int>((centerPixY - screenCenterY) / TILE_SIZE) - 1;
-    int maxTileY = static_cast<int>((centerPixY + screenCenterY) / TILE_SIZE) + 1;
-
-    // Clamp to valid tile range
-    int maxTileIndex = (1 << currentZoom) - 1;
-    minTileX = std::max(0, minTileX);
-    maxTileX = std::min(maxTileIndex, maxTileX);
-    minTileY = std::max(0, minTileY);
-    maxTileY = std::min(maxTileIndex, maxTileY);
-
-    // Count total visible tiles - only log when it changes
-    int tilesX = maxTileX - minTileX + 1;
-    int tilesY = maxTileY - minTileY + 1;
+    int tilesX = visibleTiles.maxTileX - visibleTiles.minTileX + 1;
+    int tilesY = visibleTiles.maxTileY - visibleTiles.minTileY + 1;
     int newTotal = tilesX * tilesY;
 
     if (newTotal != totalVisibleTiles) {
         totalVisibleTiles = newTotal;
-        std::cout << "[" << getTimestamp() << "] [Map Viewer] Viewport: " << tilesX << "x" << tilesY << " = "
-                  << totalVisibleTiles << " tiles" << std::endl;
+        std::cout << "[Map Viewer] Viewport: " << tilesX << "x" << tilesY << " = " << totalVisibleTiles << " tiles"
+                  << std::endl;
     }
 
     tilesLoaded = 0;
 
     // Draw tiles
-    for (int tileX = minTileX; tileX <= maxTileX; tileX++) {
-        for (int tileY = minTileY; tileY <= maxTileY; tileY++) {
+    for (int tileX = visibleTiles.minTileX; tileX <= visibleTiles.maxTileX; tileX++) {
+        for (int tileY = visibleTiles.minTileY; tileY <= visibleTiles.maxTileY; tileY++) {
             TileCoord coord{tileX, tileY, currentZoom};
             auto texture = loadTile(coord);
 
             if (texture) {
                 sf::Sprite sprite(*texture);
-                tilesLoaded++; // Count loaded tiles
+                tilesLoaded++;
 
-                // Calculate screen position
                 float screenX = screenCenterX + (tileX * TILE_SIZE - centerPixX) + viewOffset.x;
                 float screenY = screenCenterY + (tileY * TILE_SIZE - centerPixY) + viewOffset.y;
 
@@ -807,7 +815,7 @@ void MapViewer::drawTiles() {
     if (isLoadingNewLocation && tilesLoaded >= totalVisibleTiles && totalVisibleTiles > 0 &&
         framesSinceLocationChange >= 2) {
         isLoadingNewLocation = false;
-        std::cout << "[" << getTimestamp() << "] [Map Viewer] Map tiles loaded" << std::endl;
+        std::cout << "[Map Viewer] Map tiles loaded" << std::endl;
     }
 }
 

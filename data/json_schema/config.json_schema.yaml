@@ -168,14 +168,14 @@ properties:
   quiet_mode:
     type: boolean
     default: false
-    log:
-        type: object
-        additionalProperties: false
-        properties:
-            retention_days:
-                type: integer
-                default: 3
-        default: {}
+  log:
+    type: object
+    additionalProperties: false
+    properties:
+      retention_days:
+        type: integer
+        default: 3
+    default: {}
   filters:
     type: array
     items:

@@ -1,11 +1,11 @@
 #pragma once
 
-#include <vector>
-#include <string>
 #include <cstdint>
-#include <map>
 #include <filesystem>
-#include "json.hpp"
+#include <map>
+#include <nlohmann/json.hpp>
+#include <string>
+#include <vector>
 
 namespace fs = std::filesystem;
 using json = nlohmann::json;
@@ -15,4 +15,4 @@ using json = nlohmann::json;
 // Returns results in same format as extractExiftoolData: map<image_path, metadata json>
 // Parameters: imagePaths - vector of image file paths to process
 // Returns: map where key is image path and value is json object with metadata fields
-std::map<fs::path, json> extractImageMetadata(const std::vector<fs::path>& imagePaths);
+std::map<fs::path, json> extractImageMetadata(const std::vector<fs::path> &imagePaths);

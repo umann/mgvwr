@@ -5,7 +5,6 @@
 #include <inja/inja.hpp>
 #include <sstream>
 
-
 static constexpr const char *HTML_INJA_TEMPLATE = R"(
 <!DOCTYPE html> 
 <html lang="en">    
@@ -157,8 +156,9 @@ void usage(const std::string &programName, const std::string &message) {
     log_stderr("Usage: ", programName, " <image_file>");
     log_stderr("   or: ", programName, " --config <file> <image_file>");
     log_stderr("   or: ", programName, " --self-check [--config <file>]");
-    log_stderr("   or: ", programName,
-               " --cache [--config <file>] [--use-existing-thumb] [--zoom <level>] <path> [<path> ...]");
+    log_stderr(
+        "   or: ", programName,
+        " --cache [--config <file>] [--use-existing-thumb] [--ignore-dir-mtime] [--zoom <level>] <path> [<path> ...]");
     log_stderr("   or: ", programName, " --exiftool <image_file>");
     log_stderr("   or: ", programName, " --poor <image_file>");
     log_stderr("   or: ", programName, " [--config <file>] [--zoom <level>] <image_file>");

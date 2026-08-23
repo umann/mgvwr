@@ -264,15 +264,8 @@ MetadataByPath extractExiftoolData(const std::vector<fs::path> &imagePaths, cons
 json makeIncompleteMetadata(const fs::path &imagePath) {
     json metaObject = json::object();
     metaObject["SourceFile"] = imagePath.string();
-
-    try {
-        json enriched = enrichMetadataWithSchemaYaml(EXIFTOOL_RESPONSE_SCHEMA_YAML, metaObject);
-        enriched["complete"] = false;
-        return enriched;
-    } catch (...) {
-        metaObject["complete"] = false;
-        return metaObject;
-    }
+    metaObject["complete"] = false;
+    return metaObject;
 }
 
 bool ensureMetadataForImage(const fs::path &imagePath, MetadataByPath &targetCache, const ProviderOptions &options,

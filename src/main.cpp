@@ -3,11 +3,12 @@
 #include "encoding_utils.h"
 #include "exiftool_response_schema.h"
 #include "help.h"
-#include "json.hpp"
 #include "map_viewer.h"
 #include "metadata.h"
 #include "metadata_cache.h"
 #include "poor_mans_exiftool.h"
+#include "precache.h"
+#include "thumbnail_cache.h"
 #include "utils.h"
 #include <SFML/Graphics.hpp>
 #include <SFML/Window/Clipboard.hpp>
@@ -27,6 +28,7 @@
 #include <limits>
 #include <map>
 #include <mutex>
+#include <nlohmann/json.hpp>
 #include <optional>
 #include <queue>
 #include <ranges>
@@ -55,7 +57,7 @@ using json = nlohmann::json;
 
 using ImageMetadataCache = std::map<fs::path, json>;
 
-static std::string g_exiftoolPath;
+std::string g_exiftoolPath;
 
 // POOR_MANS_SUPPORTED_SUFFIXES = {".jpg", ".jpeg"}
 
@@ -225,272 +227,6 @@ struct Map {
     int zoom = 0;
     std::string gui_url_template;
 };
-
-// Get default cache directory location based on platform environment variables
-// Returns base cache directory (without subdirectories like "osm")
-static fs::path getDefaultCacheLocation() {
-    const char *localAppDataEnv = std::getenv("LOCALAPPDATA");
-    const char *homeEnv = std::getenv("HOME");
-
-    if (localAppDataEnv != nullptr) {
-        return fs::path(localAppDataEnv) / "Umann" / "MgVwr" / "cache";
-    } else if (homeEnv != nullptr) {
-        return fs::path(homeEnv) / ".cache" / "umann" / "mgvwr";
-    } else {
-        return fs::path(".") / "cache";
-    }
-}
-
-static fs::path getThumbnailCacheLocation(const fs::path &cacheRoot) {
-    return cacheRoot / "thumb";
-}
-
-static fs::path getThumbnailCacheLocation() {
-    return getThumbnailCacheLocation(getDefaultCacheLocation());
-}
-
-static std::string hashThumbnailCacheKey(const fs::path &imagePath) {
-    std::string payload = normalizePath(imagePath).string();
-
-    uint64_t hash = 1469598103934665603ULL;
-    for (unsigned char ch : payload) {
-        hash ^= ch;
-        hash *= 1099511628211ULL;
-    }
-
-    std::ostringstream oss;
-    oss << std::hex << std::setw(16) << std::setfill('0') << hash;
-    return oss.str();
-}
-
-static fs::path getThumbnailCacheFilePath(const fs::path &imagePath, const fs::path &cacheRoot) {
-    std::string cacheKey = hashThumbnailCacheKey(imagePath);
-    return getThumbnailCacheLocation(cacheRoot) / cacheKey.substr(0, 2) / (cacheKey + ".png");
-}
-
-static fs::path getThumbnailCacheMetaFilePath(const fs::path &thumbCacheFile) {
-    return fs::path(thumbCacheFile.string() + ".json");
-}
-
-static bool writeThumbnailCacheFile(const fs::path &imagePath, const fs::path &thumbCacheFile);
-
-static bool readThumbnailSourceSnapshot(const fs::path &imagePath, std::int64_t &mtime, std::int64_t &size) {
-    std::error_code ec;
-    auto fileSize = fs::file_size(imagePath, ec);
-    if (ec) {
-        return false;
-    }
-
-    auto fileTime = fs::last_write_time(imagePath, ec);
-    if (ec) {
-        return false;
-    }
-
-    auto systemNow = std::chrono::system_clock::now();
-    auto fileNow = fs::file_time_type::clock::now();
-    auto systemTime =
-        std::chrono::time_point_cast<std::chrono::system_clock::duration>(fileTime - fileNow + systemNow);
-    mtime = std::chrono::duration_cast<std::chrono::seconds>(systemTime.time_since_epoch()).count();
-    size = static_cast<std::int64_t>(fileSize);
-    return true;
-}
-
-static bool thumbnailCacheMatchesSource(const fs::path &imagePath, const fs::path &thumbCacheFile) {
-    std::error_code ec;
-    if (!fs::exists(thumbCacheFile, ec) || ec) {
-        return false;
-    }
-
-    fs::path metaFile = getThumbnailCacheMetaFilePath(thumbCacheFile);
-    if (!fs::exists(metaFile, ec) || ec) {
-        return false;
-    }
-
-    std::ifstream input(metaFile);
-    if (!input) {
-        return false;
-    }
-
-    json meta;
-    try {
-        input >> meta;
-    } catch (...) {
-        return false;
-    }
-
-    std::int64_t sourceMtime = 0;
-    std::int64_t sourceSize = 0;
-    if (!readThumbnailSourceSnapshot(imagePath, sourceMtime, sourceSize)) {
-        return false;
-    }
-
-    return meta.is_object() && meta.value("mtime", std::int64_t(-1)) == sourceMtime &&
-           meta.value("size", std::int64_t(-1)) == sourceSize;
-}
-
-static bool thumbnailCacheMatchesSource(const fs::path &thumbCacheFile, std::int64_t sourceMtime,
-                                        std::int64_t sourceSize) {
-    std::error_code ec;
-    if (!fs::exists(thumbCacheFile, ec) || ec) {
-        return false;
-    }
-
-    fs::path metaFile = getThumbnailCacheMetaFilePath(thumbCacheFile);
-    if (!fs::exists(metaFile, ec) || ec) {
-        return false;
-    }
-
-    std::ifstream input(metaFile);
-    if (!input) {
-        return false;
-    }
-
-    json meta;
-    try {
-        input >> meta;
-    } catch (...) {
-        return false;
-    }
-
-    return meta.is_object() && meta.value("mtime", std::int64_t(-1)) == sourceMtime &&
-           meta.value("size", std::int64_t(-1)) == sourceSize;
-}
-
-static bool ensureThumbnailCacheFileOnDisk(const fs::path &imagePath, const fs::path &thumbCacheFile) {
-    if (thumbnailCacheMatchesSource(imagePath, thumbCacheFile)) {
-        return true;
-    }
-    return writeThumbnailCacheFile(imagePath, thumbCacheFile);
-}
-
-static fs::path getThumbnailCacheFilePath(const fs::path &imagePath) {
-    return getThumbnailCacheFilePath(imagePath, getDefaultCacheLocation());
-}
-
-static bool writeThumbnailCacheFile(const fs::path &imagePath, const fs::path &thumbCacheFile) {
-    sf::Texture sourceTexture;
-    if (!sourceTexture.loadFromFile(imagePath.string())) {
-        return false;
-    }
-
-    auto sourceImageSize = sourceTexture.getSize();
-    const unsigned int maxThumbEdge = 256;
-    float scaleX = static_cast<float>(maxThumbEdge) / static_cast<float>(sourceImageSize.x);
-    float scaleY = static_cast<float>(maxThumbEdge) / static_cast<float>(sourceImageSize.y);
-    float scale = std::min(scaleX, scaleY);
-    unsigned int thumbWidth = std::max(1u, static_cast<unsigned int>(std::round(sourceImageSize.x * scale)));
-    unsigned int thumbHeight = std::max(1u, static_cast<unsigned int>(std::round(sourceImageSize.y * scale)));
-
-    sf::RenderTexture thumbTarget;
-    if (!thumbTarget.resize(sf::Vector2u(thumbWidth, thumbHeight))) {
-        return false;
-    }
-
-    thumbTarget.clear(sf::Color::Transparent);
-    sf::Sprite thumbSprite(sourceTexture);
-    thumbSprite.setScale({scale, scale});
-    thumbTarget.draw(thumbSprite);
-    thumbTarget.display();
-
-    sf::Image thumbImage = thumbTarget.getTexture().copyToImage();
-    if (!thumbImage.saveToFile(thumbCacheFile)) {
-        log_stdout("DEBUG", "Failed to save thumbnail cache file: ", thumbCacheFile.string());
-        return false;
-    }
-
-    std::int64_t sourceMtime = 0;
-    std::int64_t sourceSize = 0;
-    if (readThumbnailSourceSnapshot(imagePath, sourceMtime, sourceSize)) {
-        json meta = json::object();
-        meta["mtime"] = sourceMtime;
-        meta["size"] = sourceSize;
-        std::ofstream metaOut(getThumbnailCacheMetaFilePath(thumbCacheFile));
-        if (metaOut) {
-            metaOut << meta.dump();
-        }
-    }
-
-    return true;
-}
-
-unsigned int parseSizeValue(const std::string &sizeStr, unsigned int maxValue) {
-    if (sizeStr.empty())
-        return maxValue;
-
-    if (sizeStr.back() == '%') {
-        try {
-            float percentage = std::stof(sizeStr.substr(0, sizeStr.size() - 1));
-            return static_cast<unsigned int>(maxValue * percentage / 100.0f);
-        } catch (...) {
-            return maxValue;
-        }
-    } else {
-        try {
-            return static_cast<unsigned int>(std::stoul(sizeStr));
-        } catch (...) {
-            return maxValue;
-        }
-    }
-}
-
-unsigned int parseSizeValue(const nlohmann::json &v, unsigned int maxValue) {
-    if (v.is_null())
-        return maxValue;
-
-    if (v.is_number_unsigned())
-        return v.get<unsigned int>();
-    if (v.is_number_integer()) {
-        auto x = v.get<long long>();
-        return x > 0 ? static_cast<unsigned int>(x) : 0u; // or maxValue if you prefer
-    }
-    if (v.is_number_float()) {
-        auto x = v.get<double>();
-        return x > 0 ? static_cast<unsigned int>(x) : 0u; // or maxValue
-    }
-    if (v.is_string()) {
-        return parseSizeValue(v.get_ref<const std::string &>(), maxValue);
-    }
-
-    return maxValue; // unexpected type
-}
-
-enum class CacheRefreshTarget {
-    None,
-    Metadata,
-    Thumbnail,
-    MapTile,
-};
-
-static std::optional<CacheRefreshTarget> parseCacheRefreshTarget(const std::string &value) {
-    std::string normalized = value;
-    std::transform(normalized.begin(), normalized.end(), normalized.begin(),
-                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
-
-    if (normalized == "metadata") {
-        return CacheRefreshTarget::Metadata;
-    }
-    if (normalized == "thumb") {
-        return CacheRefreshTarget::Thumbnail;
-    }
-    if (normalized == "map_tile") {
-        return CacheRefreshTarget::MapTile;
-    }
-    return std::nullopt;
-}
-
-static std::string cacheRefreshTargetName(CacheRefreshTarget target) {
-    switch (target) {
-    case CacheRefreshTarget::Metadata:
-        return "metadata";
-    case CacheRefreshTarget::Thumbnail:
-        return "thumb";
-    case CacheRefreshTarget::MapTile:
-        return "map_tile";
-    case CacheRefreshTarget::None:
-        return "";
-    }
-    return "";
-}
 
 class MgVwr {
   private:
@@ -676,6 +412,10 @@ class MgVwr {
         bool folderMode = false;
         bool watchedFoldersMode = false;
         bool searchResultsActive = false;
+        fs::path currentFolder;
+        fs::path currentWatchedFolder;
+        std::vector<fs::path> allImagePaths;
+        std::vector<fs::path> allDirectories;
         size_t currentIndex = 0;
         int thumbnailScrollRow = 0;
         size_t folderModeFocusIndex = 0;
@@ -684,6 +424,7 @@ class MgVwr {
 
     // Search UI state
     bool searchUiOpen = false;
+    bool searchInputFocused = false;
     bool searchResultsActive = false;
     std::vector<size_t> searchMatchedIndices;
     std::vector<std::string> searchTokens;
@@ -1009,21 +750,35 @@ class MgVwr {
     }
 
     void showAllCurrentFolderInMap() {
-        if (!mapViewer || allImagePaths.empty() || currentIndex >= allImagePaths.size() ||
-            currentIndex >= allDirectories.size()) {
+        if (!mapViewer || allImagePaths.empty()) {
             return;
         }
 
-        fs::path currentDir = allDirectories[currentIndex];
-        std::vector<size_t> folderIndices;
-        folderIndices.reserve(allImagePaths.size());
-        for (size_t i = 0; i < allImagePaths.size(); i++) {
-            if (i < allDirectories.size() && allDirectories[i] == currentDir && passesActiveFilter(allImagePaths[i]) &&
-                hasGpsLatitude(allImagePaths[i])) {
-                folderIndices.push_back(i);
+        std::vector<size_t> mapIndices;
+        if (searchResultsActive && !searchMatchedIndices.empty()) {
+            mapIndices.reserve(searchMatchedIndices.size());
+            for (size_t idx : searchMatchedIndices) {
+                if (idx < allImagePaths.size() && passesActiveFilter(allImagePaths[idx]) &&
+                    hasGpsLatitude(allImagePaths[idx])) {
+                    mapIndices.push_back(idx);
+                }
+            }
+        } else {
+            if (currentIndex >= allImagePaths.size() || currentIndex >= allDirectories.size()) {
+                return;
+            }
+
+            fs::path currentDir = allDirectories[currentIndex];
+            mapIndices.reserve(allImagePaths.size());
+            for (size_t i = 0; i < allImagePaths.size(); i++) {
+                if (i < allDirectories.size() && allDirectories[i] == currentDir &&
+                    passesActiveFilter(allImagePaths[i]) && hasGpsLatitude(allImagePaths[i])) {
+                    mapIndices.push_back(i);
+                }
             }
         }
-        if (folderIndices.empty()) {
+
+        if (mapIndices.empty()) {
             return;
         }
 
@@ -1032,8 +787,8 @@ class MgVwr {
         double minLon = 180.0;
         double maxLon = -180.0;
         std::vector<std::pair<double, double>> folderGpsPoints;
-        folderGpsPoints.reserve(folderIndices.size());
-        for (size_t idx : folderIndices) {
+        folderGpsPoints.reserve(mapIndices.size());
+        for (size_t idx : mapIndices) {
             double lat = getGpsValueOrZero(allImagePaths[idx], "GPSLatitude");
             double lon = getGpsValueOrZero(allImagePaths[idx], "GPSLongitude");
             minLat = std::min(minLat, lat);
@@ -1058,7 +813,7 @@ class MgVwr {
             latLonToPixelAtZoom(centerLat, centerLon, z, centerPixX, centerPixY);
 
             bool allVisible = true;
-            for (size_t idx : folderIndices) {
+            for (size_t idx : mapIndices) {
                 double lat = getGpsValueOrZero(allImagePaths[idx], "GPSLatitude");
                 double lon = getGpsValueOrZero(allImagePaths[idx], "GPSLongitude");
                 double pointPixX = 0.0;
@@ -1080,13 +835,12 @@ class MgVwr {
             }
         }
 
-        // Do not auto-zoom in beyond the configured default when points are very close.
         fitZoom = std::min(fitZoom, defaultZoom);
 
         mapViewer->showMap(centerLat, centerLon, fitZoom);
         mapViewer->setGPSPoints(folderGpsPoints);
 
-        if (hasGpsLatitude(allImagePaths[currentIndex])) {
+        if (currentIndex < allImagePaths.size() && hasGpsLatitude(allImagePaths[currentIndex])) {
             double lat = getGpsValueOrZero(allImagePaths[currentIndex], "GPSLatitude");
             double lon = getGpsValueOrZero(allImagePaths[currentIndex], "GPSLongitude");
             mapViewer->updateMarkerOnly(lat, lon);
@@ -1217,6 +971,43 @@ class MgVwr {
         return static_cast<size_t>(std::distance(searchMatchedIndices.begin(), it));
     }
 
+    std::string getCurrentNavigationIndexLabel() const {
+        if (searchResultsActive && !searchMatchedIndices.empty()) {
+            const auto pos = currentSearchResultPosition();
+            if (pos.has_value()) {
+                return std::to_string(pos.value() + 1) + "/" + std::to_string(searchMatchedIndices.size());
+            }
+            return "0/" + std::to_string(searchMatchedIndices.size());
+        }
+
+        if (activeFilterIndex >= 0 && activeFilterIndex < static_cast<int>(filters.size())) {
+            size_t filteredCount = 0;
+            size_t currentFilteredPosition = 0;
+            bool foundCurrent = false;
+
+            for (size_t i = 0; i < allImagePaths.size(); i++) {
+                if (passesActiveFilter(allImagePaths[i])) {
+                    filteredCount++;
+                    if (i < currentIndex || (i == currentIndex && !foundCurrent)) {
+                        currentFilteredPosition = filteredCount;
+                        if (i == currentIndex) {
+                            foundCurrent = true;
+                        }
+                    }
+                }
+            }
+
+            if (filteredCount > 0) {
+                return std::to_string(currentFilteredPosition) + "/" + std::to_string(filteredCount);
+            }
+        }
+
+        if (allImagePaths.empty()) {
+            return "0/0";
+        }
+        return std::to_string(currentIndex + 1) + "/" + std::to_string(allImagePaths.size());
+    }
+
     bool navigateWithinSearchResultsByOffset(int delta, bool useThumbnailSelectionFlow) {
         if (!isSearchResultSetActive() || allImagePaths.empty()) {
             return false;
@@ -1325,8 +1116,24 @@ class MgVwr {
             contextMenuItems.push_back({"Open in Google Maps", true, ContextMenuAction::OpenGoogleMaps});
         }
 
-        if (mapViewer && hasFolderGps) {
-            contextMenuItems.push_back({"Show entire folder in map", true, ContextMenuAction::ShowAllInMap});
+        if (mapViewer) {
+            bool showSearchResultsGps = false;
+            if (searchResultsActive && !searchMatchedIndices.empty()) {
+                for (size_t idx : searchMatchedIndices) {
+                    if (idx < allImagePaths.size() && passesActiveFilter(allImagePaths[idx]) &&
+                        hasGpsLatitude(allImagePaths[idx])) {
+                        showSearchResultsGps = true;
+                        break;
+                    }
+                }
+            }
+
+            if (showSearchResultsGps || hasFolderGps) {
+                const char *showAllMapText = (searchResultsActive && !searchMatchedIndices.empty())
+                                                 ? "Show all search results in map"
+                                                 : "Show entire folder in map";
+                contextMenuItems.push_back({showAllMapText, true, ContextMenuAction::ShowAllInMap});
+            }
         }
 
         contextMenuItems.push_back(
@@ -2194,17 +2001,29 @@ class MgVwr {
         return out;
     }
 
+    void clearActiveSearchResults() {
+        searchResultsActive = false;
+        searchMatchedIndices.clear();
+    }
+
     void openSearchUi() {
-        searchSnapshot.valid = true;
-        searchSnapshot.thumbnailMode = thumbnailMode;
-        searchSnapshot.folderMode = folderMode;
-        searchSnapshot.watchedFoldersMode = watchedFoldersMode;
-        searchSnapshot.searchResultsActive = searchResultsActive;
-        searchSnapshot.currentIndex = currentIndex;
-        searchSnapshot.thumbnailScrollRow = thumbnailScrollRow;
-        searchSnapshot.folderModeFocusIndex = folderModeFocusIndex;
-        searchSnapshot.searchMatchedIndices = searchMatchedIndices;
+        if (!searchSnapshot.valid) {
+            searchSnapshot.valid = true;
+            searchSnapshot.thumbnailMode = thumbnailMode;
+            searchSnapshot.folderMode = folderMode;
+            searchSnapshot.watchedFoldersMode = watchedFoldersMode;
+            searchSnapshot.searchResultsActive = searchResultsActive;
+            searchSnapshot.currentFolder = currentFolder;
+            searchSnapshot.currentWatchedFolder = currentWatchedFolder;
+            searchSnapshot.allImagePaths = allImagePaths;
+            searchSnapshot.allDirectories = allDirectories;
+            searchSnapshot.currentIndex = currentIndex;
+            searchSnapshot.thumbnailScrollRow = thumbnailScrollRow;
+            searchSnapshot.folderModeFocusIndex = folderModeFocusIndex;
+            searchSnapshot.searchMatchedIndices = searchMatchedIndices;
+        }
         searchUiOpen = true;
+        searchInputFocused = true;
         searchPrefixCursor = std::min(searchPrefixCursor, searchPrefix.size());
         refreshSearchSuggestions();
         lastSearchCursorBlinkTime = std::chrono::steady_clock::now();
@@ -2216,24 +2035,61 @@ class MgVwr {
         if (!searchSnapshot.valid) {
             return;
         }
-        thumbnailMode = searchSnapshot.thumbnailMode;
-        folderMode = searchSnapshot.folderMode;
-        watchedFoldersMode = searchSnapshot.watchedFoldersMode;
-        searchResultsActive = searchSnapshot.searchResultsActive;
-        searchMatchedIndices = searchSnapshot.searchMatchedIndices;
+
+        const bool restoreThumbnailView = searchSnapshot.thumbnailMode;
+        const bool restoreFolderMode = searchSnapshot.folderMode;
+        const bool restoreWatchedFoldersMode = searchSnapshot.watchedFoldersMode;
+        const bool restoreSearchResultsActive = searchSnapshot.searchResultsActive;
+        const fs::path restoreCurrentFolder = searchSnapshot.currentFolder;
+        const fs::path restoreCurrentWatchedFolder = searchSnapshot.currentWatchedFolder;
+        const std::vector<fs::path> restoreAllImagePaths = searchSnapshot.allImagePaths;
+        const std::vector<fs::path> restoreAllDirectories = searchSnapshot.allDirectories;
+        const size_t restoreCurrentIndex = searchSnapshot.currentIndex;
+
+        allImagePaths = restoreAllImagePaths;
+        allDirectories = restoreAllDirectories;
+        currentFolder = restoreCurrentFolder;
+        currentWatchedFolder = restoreCurrentWatchedFolder;
+        thumbnailMode = restoreThumbnailView;
+        folderMode = restoreFolderMode;
+        watchedFoldersMode = restoreWatchedFoldersMode;
+        searchResultsActive = restoreSearchResultsActive;
+        if (restoreSearchResultsActive) {
+            searchMatchedIndices = searchSnapshot.searchMatchedIndices;
+        } else {
+            searchMatchedIndices.clear();
+        }
         thumbnailScrollRow = searchSnapshot.thumbnailScrollRow;
         folderModeFocusIndex = searchSnapshot.folderModeFocusIndex;
+        currentIndex = restoreCurrentIndex;
         if (!allImagePaths.empty()) {
-            currentIndex = std::min(searchSnapshot.currentIndex, allImagePaths.size() - 1);
+            currentIndex = std::min(currentIndex, allImagePaths.size() - 1);
+        } else {
+            currentIndex = 0;
         }
+
+        if (searchSnapshot.thumbnailMode) {
+            onThumbnailSelectionChanged();
+        } else if (!allImagePaths.empty()) {
+            loadImage(currentIndex);
+        }
+
         searchSnapshot.valid = false;
     }
 
     void closeSearchUiAndRestore() {
-        if (searchUiOpen) {
+        if (searchSnapshot.valid) {
             restoreSearchSnapshotState();
+        } else {
+            searchResultsActive = false;
+            searchMatchedIndices.clear();
         }
+        navigationMessage.clear();
         searchUiOpen = false;
+        searchInputFocused = false;
+        searchTokens.clear();
+        searchPrefix.clear();
+        searchPrefixCursor = 0;
         searchSuggestions.clear();
         highlightedSearchSuggestion = -1;
         searchZeroMatchesHint = false;
@@ -2242,7 +2098,8 @@ class MgVwr {
     }
 
     void closeSearchUiAfterSubmit() {
-        searchUiOpen = false;
+        searchInputFocused = false;
+        searchCursorVisible = false;
         searchSuggestions.clear();
         highlightedSearchSuggestion = -1;
         searchZeroMatchesHint = false;
@@ -2332,17 +2189,17 @@ class MgVwr {
             std::string firstRow = "null";
             while (sqlite3_step(stmt) == SQLITE_ROW) {
                 ++rowCount;
+                const unsigned char *tokenText = sqlite3_column_text(stmt, 0);
+                std::int64_t cnt = sqlite3_column_int64(stmt, 1);
                 if (rowCount == 1) {
-                    const unsigned char *tokenText = sqlite3_column_text(stmt, 0);
                     std::string tokenName = tokenText ? reinterpret_cast<const char *>(tokenText) : "";
-                    std::int64_t cnt = sqlite3_column_int64(stmt, 1);
                     std::ostringstream firstRowBuilder;
                     firstRowBuilder << "{name: \"" << tokenName << "\", image_count: " << cnt << "}";
                     firstRow = firstRowBuilder.str();
-                    if (tokenText) {
-                        std::string rawToken(reinterpret_cast<const char *>(tokenText));
-                        out.push_back({rawToken, repairMojibakeIfNeeded(rawToken), cnt});
-                    }
+                }
+                if (tokenText) {
+                    std::string rawToken(reinterpret_cast<const char *>(tokenText));
+                    out.push_back({rawToken, repairMojibakeIfNeeded(rawToken), cnt});
                 }
             }
             log_stdout("Results: ", rowCount, " First: ", firstRow);
@@ -2415,17 +2272,17 @@ class MgVwr {
                 std::string firstRow = "null";
                 while (sqlite3_step(fallbackStmt) == SQLITE_ROW) {
                     ++rowCount;
+                    const unsigned char *tokenText = sqlite3_column_text(fallbackStmt, 0);
+                    std::int64_t cnt = sqlite3_column_int64(fallbackStmt, 1);
                     if (rowCount == 1) {
-                        const unsigned char *tokenText = sqlite3_column_text(fallbackStmt, 0);
                         std::string tokenName = tokenText ? reinterpret_cast<const char *>(tokenText) : "";
-                        std::int64_t cnt = sqlite3_column_int64(fallbackStmt, 1);
                         std::ostringstream firstRowBuilder;
                         firstRowBuilder << "{name: \"" << tokenName << "\", image_count: " << cnt << "}";
                         firstRow = firstRowBuilder.str();
-                        if (tokenText) {
-                            std::string rawToken(reinterpret_cast<const char *>(tokenText));
-                            out.push_back({rawToken, repairMojibakeIfNeeded(rawToken), cnt});
-                        }
+                    }
+                    if (tokenText) {
+                        std::string rawToken(reinterpret_cast<const char *>(tokenText));
+                        out.push_back({rawToken, repairMojibakeIfNeeded(rawToken), cnt});
                     }
                 }
                 log_stdout("Results: ", rowCount, " First: ", firstRow);
@@ -2469,6 +2326,14 @@ class MgVwr {
             refreshSearchSuggestions();
             return false;
         }
+
+        // A new token starts a new composed query. Any previously live result set must be reset
+        // before the user edits the search terms or submits again, otherwise stale counts/indexes
+        // remain in the UI while the new query is being built.
+        searchResultsActive = false;
+        searchMatchedIndices.clear();
+        navigationMessage.clear();
+
         searchTokens.push_back(token);
         searchPrefix.clear();
         searchPrefixCursor = 0;
@@ -2551,15 +2416,12 @@ class MgVwr {
 
         int rowCount = 0;
         std::string firstRow = "null";
-        std::unordered_map<std::string, size_t> pathToIndex;
-        for (size_t i = 0; i < allImagePaths.size(); i++) {
-            pathToIndex[normalizePathForSearch(fs::absolute(allImagePaths[i]))] = i;
-        }
+        std::vector<fs::path> matchedImagePaths;
+        std::vector<fs::path> matchedDirectories;
+        std::unordered_map<std::string, size_t> seenMatches;
 
         size_t dbRows = 0;
         size_t mappedRows = 0;
-        size_t appendedRows = 0;
-        std::string firstUnmapped;
         while (sqlite3_step(stmt) == SQLITE_ROW) {
             dbRows++;
             if (dbRows == 1) {
@@ -2588,24 +2450,18 @@ class MgVwr {
             candidateAbs = candidateAbs.lexically_normal();
 
             const std::string key = normalizePathForSearch(candidateAbs);
-            auto it = pathToIndex.find(key);
-            if (it == pathToIndex.end()) {
-                const size_t newIndex = allImagePaths.size();
-                allImagePaths.push_back(candidateAbs);
-                allDirectories.push_back(candidateAbs.parent_path());
-                pathToIndex[key] = newIndex;
-                it = pathToIndex.find(key);
-                appendedRows++;
+            if (seenMatches.find(key) != seenMatches.end()) {
+                continue;
             }
 
-            if (it != pathToIndex.end()) {
-                if (passesActiveFilter(allImagePaths[it->second])) {
-                    out.push_back(it->second);
-                    mappedRows++;
-                }
-            } else if (firstUnmapped.empty()) {
-                firstUnmapped = key;
+            if (!passesActiveFilter(candidateAbs)) {
+                continue;
             }
+
+            seenMatches[key] = matchedImagePaths.size();
+            matchedImagePaths.push_back(candidateAbs);
+            matchedDirectories.push_back(candidateAbs.parent_path());
+            mappedRows++;
         }
 
         log_stdout("Results: ", dbRows, " First: ", firstRow);
@@ -2613,11 +2469,15 @@ class MgVwr {
         sqlite3_finalize(stmt);
         sqlite3_close(db);
 
-        std::sort(out.begin(), out.end());
-        out.erase(std::unique(out.begin(), out.end()), out.end());
+        if (!matchedImagePaths.empty()) {
+            allImagePaths = matchedImagePaths;
+            allDirectories = matchedDirectories;
+            out.resize(matchedImagePaths.size());
+            std::iota(out.begin(), out.end(), 0);
+        }
+
         log_stdout("DEBUG search: matched rows from DB=", dbRows, ", mapped rows=", mappedRows,
-                   ", appended rows=", appendedRows, ", unique hits=", out.size(), ", file column=", fileNameColumn,
-                   firstUnmapped.empty() ? std::string("") : std::string(", first unmapped=") + firstUnmapped);
+                   ", unique hits=", out.size(), ", file column=", fileNameColumn);
         return out;
     }
 
@@ -2625,21 +2485,31 @@ class MgVwr {
         log_stdout("DEBUG search: submit start tokens=", searchTokens.size(), ", prefix bytes=", searchPrefix.size(),
                    ", suggestions=", searchSuggestions.size(), ", highlighted=", highlightedSearchSuggestion);
 
-        if (!searchPrefix.empty() && !searchSuggestions.empty()) {
-            size_t pick = 0;
-            if (highlightedSearchSuggestion >= 0 &&
+        std::vector<std::string> submitTokens = searchTokens;
+        if (!searchPrefix.empty()) {
+            std::string chosenToken = searchPrefix;
+            if (!searchSuggestions.empty() && highlightedSearchSuggestion >= 0 &&
                 highlightedSearchSuggestion < static_cast<int>(searchSuggestions.size())) {
-                pick = static_cast<size_t>(highlightedSearchSuggestion);
+                chosenToken = searchSuggestions[static_cast<size_t>(highlightedSearchSuggestion)].token;
             }
-            log_stdout("DEBUG search: submit adds suggestion token='", searchSuggestions[pick].token, "'");
-            addSearchToken(searchSuggestions[pick].token);
+            if (!chosenToken.empty() &&
+                std::find(submitTokens.begin(), submitTokens.end(), chosenToken) == submitTokens.end()) {
+                submitTokens.push_back(chosenToken);
+            }
+            searchPrefix.clear();
+            searchPrefixCursor = 0;
+            refreshSearchSuggestions();
         }
 
-        if (searchTokens.empty()) {
+        if (submitTokens.empty()) {
+            searchTokens.clear();
             navigationMessage = "Search: no token";
             log_stdout("DEBUG search: submit aborted, no tokens selected");
             return false;
         }
+
+        searchTokens = submitTokens;
+        clearActiveSearchResults();
 
         std::ostringstream tok;
         for (size_t i = 0; i < searchTokens.size(); i++) {
@@ -2662,6 +2532,9 @@ class MgVwr {
         thumbnailMode = true;
         folderMode = false;
         watchedFoldersMode = false;
+        // Search submit swaps the image/index set; clear stale ready/queued thumbnail indices.
+        resetThumbnailLoadingState();
+        thumbnailCollectionMessageActive = true;
         currentIndex = searchMatchedIndices.front();
         onThumbnailSelectionChanged();
         navigationMessage = "Search hits: " + std::to_string(searchMatchedIndices.size());
@@ -5137,7 +5010,7 @@ class MgVwr {
                     }
                     handleKeyPress(*keyEvent);
                 } else if (const auto *textEvent = event->getIf<sf::Event::TextEntered>()) {
-                    if (searchUiOpen) {
+                    if (searchUiOpen && searchInputFocused) {
                         std::uint32_t uni = textEvent->unicode;
                         if (uni >= 32 && uni != 127) {
                             std::string utf8 = encodeUtf8(uni);
@@ -5182,6 +5055,8 @@ class MgVwr {
                             }
 
                             if (searchSubmitButtonRect.contains(clickPos)) {
+                                log_stdout("DEBUG search: submit button clicked, tokens=", searchTokens.size(),
+                                           " prefix='", searchPrefix, "'");
                                 submitSearchQuery();
                                 continue;
                             }
@@ -5211,6 +5086,9 @@ class MgVwr {
                             }
 
                             if (searchInputHitRect.contains(clickPos)) {
+                                searchInputFocused = true;
+                                searchCursorVisible = true;
+                                lastSearchCursorBlinkTime = std::chrono::steady_clock::now();
                                 continue;
                             }
                         }
@@ -6201,10 +6079,14 @@ class MgVwr {
             caretY = cursorY;
         }
 
-        auto now = std::chrono::steady_clock::now();
-        if (now - lastSearchCursorBlinkTime >= std::chrono::milliseconds(500)) {
-            searchCursorVisible = !searchCursorVisible;
-            lastSearchCursorBlinkTime = now;
+        if (searchInputFocused) {
+            auto now = std::chrono::steady_clock::now();
+            if (now - lastSearchCursorBlinkTime >= std::chrono::milliseconds(500)) {
+                searchCursorVisible = !searchCursorVisible;
+                lastSearchCursorBlinkTime = now;
+            }
+        } else {
+            searchCursorVisible = false;
         }
         if (searchCursorVisible) {
             sf::RectangleShape caret(sf::Vector2f(1.5f, std::max(8.0f, rowH - 4.0f)));
@@ -6361,31 +6243,8 @@ class MgVwr {
 
         std::vector<std::string> lines;
 
-        // Calculate index line - adjust for active filter if present
-        std::string indexLine;
-        if (activeFilterIndex >= 0 && activeFilterIndex < static_cast<int>(filters.size())) {
-            // Filter is active - count filtered images and find current position
-            size_t filteredCount = 0;
-            size_t currentFilteredPosition = 0;
-            bool foundCurrent = false;
-
-            for (size_t i = 0; i < allImagePaths.size(); i++) {
-                if (passesActiveFilter(allImagePaths[i])) {
-                    filteredCount++;
-                    if (i < currentIndex || (i == currentIndex && !foundCurrent)) {
-                        currentFilteredPosition = filteredCount;
-                        if (i == currentIndex) {
-                            foundCurrent = true;
-                        }
-                    }
-                }
-            }
-
-            indexLine = std::to_string(currentFilteredPosition) + "/" + std::to_string(filteredCount);
-        } else {
-            // No filter active - show total count
-            indexLine = std::to_string(currentIndex + 1) + "/" + std::to_string(allImagePaths.size());
-        }
+        // Calculate index line. Search results must use the active result set, not the underlying folder list.
+        std::string indexLine = getCurrentNavigationIndexLabel();
 
         if (sortByNameCurrentFolder) {
             indexLine += " by name";
@@ -6603,64 +6462,86 @@ class MgVwr {
     }
 
     void handleKeyPress(const sf::Event::KeyPressed &key) {
+        log_stdout("DEBUG search: key pressed code=", static_cast<int>(key.code), " searchUiOpen=", searchUiOpen,
+                   " searchInputFocused=", searchInputFocused, " tokens=", searchTokens.size(), " prefix='",
+                   searchPrefix, "'");
+
         if (searchUiOpen) {
-            switch (key.code) {
-            case sf::Keyboard::Key::Escape:
+            if (key.code == sf::Keyboard::Key::Escape) {
                 closeSearchUiAndRestore();
                 return;
-            case sf::Keyboard::Key::Left:
-                searchPrefixCursor = prevUtf8Offset(searchPrefix, searchPrefixCursor);
-                return;
-            case sf::Keyboard::Key::Right:
-                searchPrefixCursor = nextUtf8Offset(searchPrefix, searchPrefixCursor);
-                return;
-            case sf::Keyboard::Key::Backspace:
-                if (searchPrefixCursor > 0) {
-                    size_t prev = prevUtf8Offset(searchPrefix, searchPrefixCursor);
-                    searchPrefix.erase(prev, searchPrefixCursor - prev);
-                    searchPrefixCursor = prev;
-                    refreshSearchSuggestions();
-                } else if (!searchTokens.empty()) {
-                    searchTokens.pop_back();
-                    refreshSearchSuggestions();
-                }
-                return;
-            case sf::Keyboard::Key::Delete:
-                if (searchPrefixCursor < searchPrefix.size()) {
-                    size_t next = nextUtf8Offset(searchPrefix, searchPrefixCursor);
-                    searchPrefix.erase(searchPrefixCursor, next - searchPrefixCursor);
-                    refreshSearchSuggestions();
-                }
-                return;
-            case sf::Keyboard::Key::Up:
-                if (!searchSuggestions.empty()) {
-                    if (highlightedSearchSuggestion < 0) {
-                        highlightedSearchSuggestion = static_cast<int>(searchSuggestions.size()) - 1;
-                    } else {
-                        highlightedSearchSuggestion =
-                            (highlightedSearchSuggestion - 1 + static_cast<int>(searchSuggestions.size())) %
-                            static_cast<int>(searchSuggestions.size());
-                    }
-                }
-                return;
-            case sf::Keyboard::Key::Down:
-                if (!searchSuggestions.empty()) {
-                    if (highlightedSearchSuggestion < 0) {
-                        highlightedSearchSuggestion = 0;
-                    } else {
-                        highlightedSearchSuggestion =
-                            (highlightedSearchSuggestion + 1) % static_cast<int>(searchSuggestions.size());
-                    }
-                }
-                return;
-            case sf::Keyboard::Key::Enter:
+            }
+
+            if (key.code == sf::Keyboard::Key::Enter) {
+                log_stdout("DEBUG search: Enter pressed in search UI");
                 if (submitSearchQuery()) {
                     closeSearchUiAfterSubmit();
                 }
                 return;
-            default:
-                break;
             }
+
+            if (searchInputFocused) {
+                switch (key.code) {
+                case sf::Keyboard::Key::Left:
+                    searchPrefixCursor = prevUtf8Offset(searchPrefix, searchPrefixCursor);
+                    return;
+                case sf::Keyboard::Key::Right:
+                    searchPrefixCursor = nextUtf8Offset(searchPrefix, searchPrefixCursor);
+                    return;
+                case sf::Keyboard::Key::Backspace:
+                    if (searchPrefixCursor > 0) {
+                        size_t prev = prevUtf8Offset(searchPrefix, searchPrefixCursor);
+                        searchPrefix.erase(prev, searchPrefixCursor - prev);
+                        searchPrefixCursor = prev;
+                        refreshSearchSuggestions();
+                    } else if (!searchTokens.empty()) {
+                        searchTokens.pop_back();
+                        refreshSearchSuggestions();
+                    }
+                    return;
+                case sf::Keyboard::Key::Delete:
+                    if (searchPrefixCursor < searchPrefix.size()) {
+                        size_t next = nextUtf8Offset(searchPrefix, searchPrefixCursor);
+                        searchPrefix.erase(searchPrefixCursor, next - searchPrefixCursor);
+                        refreshSearchSuggestions();
+                    }
+                    return;
+                case sf::Keyboard::Key::Up:
+                    if (!searchSuggestions.empty()) {
+                        if (highlightedSearchSuggestion < 0) {
+                            highlightedSearchSuggestion = static_cast<int>(searchSuggestions.size()) - 1;
+                        } else {
+                            highlightedSearchSuggestion =
+                                (highlightedSearchSuggestion - 1 + static_cast<int>(searchSuggestions.size())) %
+                                static_cast<int>(searchSuggestions.size());
+                        }
+                    }
+                    return;
+                case sf::Keyboard::Key::Down:
+                    if (!searchSuggestions.empty()) {
+                        if (highlightedSearchSuggestion < 0) {
+                            highlightedSearchSuggestion = 0;
+                        } else {
+                            highlightedSearchSuggestion =
+                                (highlightedSearchSuggestion + 1) % static_cast<int>(searchSuggestions.size());
+                        }
+                    }
+                    return;
+                default:
+                    break;
+                }
+            }
+        }
+
+        if (key.code == sf::Keyboard::Key::Backspace && searchResultsActive && thumbnailMode && !folderMode) {
+            showCurrentSearchResultInItsFolder();
+            return;
+        }
+
+        if (key.code == sf::Keyboard::Key::Enter && searchResultsActive && thumbnailMode && !folderMode) {
+            thumbnailMode = false;
+            loadImage(currentIndex);
+            return;
         }
 
         if (key.code == sf::Keyboard::Key::Enter && thumbnailMode &&
@@ -7082,388 +6963,7 @@ class MgVwr {
     }
 };
 
-// Recursively find all image files in a directory or return single file
-std::vector<fs::path> findImageFiles(const fs::path &path, const std::vector<std::string> &supportedSuffixes) {
-    std::vector<fs::path> results;
-
-    if (fs::is_regular_file(path)) {
-        std::string ext = path.extension().string();
-        std::transform(ext.begin(), ext.end(), ext.begin(), ::tolower);
-        for (const auto &suffix : supportedSuffixes) {
-            if (ext == suffix) {
-                results.push_back(path);
-                break;
-            }
-        }
-        return results;
-    }
-
-    if (fs::is_directory(path)) {
-        for (const auto &entry :
-             fs::recursive_directory_iterator(path, fs::directory_options::skip_permission_denied)) {
-            if (entry.is_regular_file()) {
-                std::string ext = entry.path().extension().string();
-                std::transform(ext.begin(), ext.end(), ext.begin(), ::tolower);
-                for (const auto &suffix : supportedSuffixes) {
-                    if (ext == suffix) {
-                        results.push_back(entry.path());
-                        break;
-                    }
-                }
-            }
-        }
-    }
-
-    return results;
-}
-
-// Calculate tiles needed for a GPS coordinate at a given zoom and window size
-std::vector<MapViewer::TileCoord> calculateTilesForView(double latitude, double longitude, int zoom, int windowWidth,
-                                                        int windowHeight) {
-    std::vector<MapViewer::TileCoord> tiles;
-
-    // Use the same logic as MapViewer::updateTileLoadingState
-    const int TILE_SIZE = 256;
-
-    // Convert GPS to pixel coordinates
-    double n = std::pow(2.0, zoom);
-    double centerPixX = (longitude + 180.0) / 360.0 * n * TILE_SIZE;
-    double latRad = latitude * M_PI / 180.0;
-    double centerPixY = (1.0 - std::asinh(std::tan(latRad)) / M_PI) / 2.0 * n * TILE_SIZE;
-
-    // Calculate visible tile range
-    int screenCenterX = windowWidth / 2;
-    int screenCenterY = windowHeight / 2;
-
-    int minTileX = static_cast<int>((centerPixX - screenCenterX) / TILE_SIZE) - 1;
-    int maxTileX = static_cast<int>((centerPixX + screenCenterX) / TILE_SIZE) + 1;
-    int minTileY = static_cast<int>((centerPixY - screenCenterY) / TILE_SIZE) - 1;
-    int maxTileY = static_cast<int>((centerPixY + screenCenterY) / TILE_SIZE) + 1;
-
-    // Clamp to valid tile range
-    int maxTileIndex = (1 << zoom) - 1;
-    minTileX = std::max(0, minTileX);
-    maxTileX = std::min(maxTileIndex, maxTileX);
-    minTileY = std::max(0, minTileY);
-    maxTileY = std::min(maxTileIndex, maxTileY);
-
-    // Generate tile coordinates
-    for (int tileX = minTileX; tileX <= maxTileX; tileX++) {
-        for (int tileY = minTileY; tileY <= maxTileY; tileY++) {
-            MapViewer::TileCoord coord;
-            coord.x = tileX;
-            coord.y = tileY;
-            coord.zoom = zoom;
-            tiles.push_back(coord);
-        }
-    }
-
-    return tiles;
-}
-
-// Main function for --cache mode
-int runCacheMode(const std::vector<std::string> &paths, const std::string &configPath, bool useExistingThumb,
-                 CacheRefreshTarget forceRefreshTarget) {
-    log_stdout("Cache prepopulation mode");
-
-    // Load configuration using schema validation
-    fs::path cacheRoot;
-    int defaultZoom = 15;
-    unsigned int windowWidth = 1024;
-    unsigned int windowHeight = 768;
-
-    std::vector<std::string> supportedSuffixes;
-
-    try {
-        // Load and validate config using schema-driven system (structure guaranteed by validation)
-        fs::path configDir = fs::path(configPath).parent_path();
-        json config = loadAndValidateConfig(configDir);
-
-        // Extract map cache location (schema-validated, safe to access directly)
-        std::string location = config["map"]["cache"]["location"];
-        if (!location.empty()) {
-            cacheRoot = location;
-        }
-
-        // Extract zoom config
-        defaultZoom = config["map"]["viewer"]["zoom"]["default"];
-
-        // Parse window size (handles both string percentages and integer pixels)
-        sf::VideoMode desktopMode = sf::VideoMode::getDesktopMode();
-        const auto &sizeArray = config["map"]["viewer"]["window"]["size"];
-        windowWidth = parseSizeValue(sizeArray[0], desktopMode.size.x);
-        windowHeight = parseSizeValue(sizeArray[1], desktopMode.size.y);
-
-        // Extract supported image suffixes
-        for (const auto &suffix : config["image_file"]["supported_suffixes"]) {
-            supportedSuffixes.push_back(suffix.get<std::string>());
-        }
-    } catch (const std::exception &e) {
-        log_stderr("Error loading config: ", e.what());
-        throw;
-    }
-
-    // Use same default cache location as GUI app if not specified.
-    if (cacheRoot.empty()) {
-        cacheRoot = getDefaultCacheLocation();
-    }
-
-    log_stdout("Cache root (config): ", cacheRoot.string());
-
-    // Cache larger area to handle panning (3x window size in each direction)
-    const int expandedWidth = windowWidth * 3;
-    const int expandedHeight = windowHeight * 3;
-    log_stdout("Default view: ", windowWidth, "x", windowHeight, " at zoom ", defaultZoom);
-    log_stdout("Expanded cache area: ", expandedWidth, "x", expandedHeight, " (to handle panning)");
-
-    // Ensure cache directory exists
-    fs::path osmCacheDir = cacheRoot / "osm";
-    fs::path thumbCacheDir = getThumbnailCacheLocation(cacheRoot);
-    fs::create_directories(cacheRoot);
-    fs::create_directories(osmCacheDir);
-    fs::create_directories(thumbCacheDir);
-    log_stdout("Cache root (resolved): ", fs::absolute(cacheRoot).string());
-
-    // Find exiftool using metadata service
-    std::string exiftoolPath;
-    bool exiftoolFound = metadata::findExiftool(exiftoolPath);
-    g_exiftoolPath = exiftoolPath;
-    if (!exiftoolFound || g_exiftoolPath.empty()) {
-        log_stderr("Error: exiftool not found. Please install exiftool.");
-        return 1;
-    }
-
-    log_stdout("Using exiftool: ", g_exiftoolPath);
-
-    // Collect all image files from input paths
-    std::vector<fs::path> allFiles;
-    for (const auto &pathStr : paths) {
-        fs::path path(pathStr);
-        log_stdout("Scanning: ", pathToString(path.make_preferred()));
-
-        auto files = findImageFiles(path, supportedSuffixes);
-        log_stdout("Found ", files.size(), " image file(s)");
-
-        allFiles.insert(allFiles.end(), files.begin(), files.end());
-    }
-
-    if (allFiles.empty()) {
-        log_stderr("No image files found");
-        return 1;
-    }
-
-    log_stdout("Total image files: ", allFiles.size());
-
-    std::string metadataCacheError;
-    fs::path metadataCacheFile = metadata_cache::defaultMetadataCacheFile(cacheRoot);
-    if (metadata_cache::initializeMetadataCache(metadataCacheFile, metadataCacheError)) {
-        log_stdout("Metadata cache initialized at: ", pathToString(metadataCacheFile.make_preferred()));
-    } else {
-        log_stderr("Metadata cache initialization failed: ", metadataCacheError);
-        return 1;
-    }
-
-    const size_t batchSize = 50;
-    bool hadErrors = false;
-    size_t totalCacheHits = 0;
-    size_t totalCacheMisses = 0;
-
-    if (useExistingThumb) {
-        log_stdout("Thumbnail mode: --use-existing-thumb enabled (existing thumbnails are kept as-is)");
-    }
-    if (forceRefreshTarget != CacheRefreshTarget::None) {
-        log_stdout("Cache force refresh enabled for: ", cacheRefreshTargetName(forceRefreshTarget));
-    }
-
-    auto hasValidGps = [](const json &meta) {
-        return meta.contains("GPSLatitude") && meta["GPSLatitude"].is_number() && meta.contains("GPSLongitude") &&
-               meta["GPSLongitude"].is_number();
-    };
-
-    // Track unique tile coordinates across all batches.
-    std::set<std::tuple<int, int, int>> uniqueTiles; // <x, y, zoom>
-    const char *TILE_SERVER_HOST = "tile.openstreetmap.org";
-    const char *USER_AGENT = "mgvwr/1.0";
-    int downloadedCount = 0;
-    int skippedCount = 0;
-    int validGPSCount = 0;
-    auto lastDownloadTime = std::chrono::steady_clock::now();
-
-    auto processTile = [&](int x, int y, int zoom) {
-        const auto tileCoord = std::make_tuple(x, y, zoom);
-        if (!uniqueTiles.insert(tileCoord).second) {
-            return;
-        }
-
-        fs::path tilePath = osmCacheDir / std::to_string(zoom) / std::to_string(x) / (std::to_string(y) + ".png");
-
-        if (forceRefreshTarget == CacheRefreshTarget::MapTile) {
-            std::error_code ec;
-            fs::remove(tilePath, ec);
-        }
-
-        if (fs::exists(tilePath) && fs::file_size(tilePath) > 0) {
-            skippedCount++;
-            return;
-        }
-
-        auto now = std::chrono::steady_clock::now();
-        auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - lastDownloadTime);
-        if (elapsed.count() < 250) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(250 - elapsed.count()));
-        }
-
-        std::string url = "https://" + std::string(TILE_SERVER_HOST) + "/" + std::to_string(zoom) + "/" +
-                          std::to_string(x) + "/" + std::to_string(y) + ".png";
-
-        fs::create_directories(tilePath.parent_path());
-
-        std::string command =
-            "curl -s -f -L -A \"" + std::string(USER_AGENT) + "\" -o \"" + tilePath.string() + "\" \"" + url + "\"";
-
-        int result = system(command.c_str());
-        lastDownloadTime = std::chrono::steady_clock::now();
-
-        if (result == 0 && fs::exists(tilePath) && fs::file_size(tilePath) > 0) {
-            downloadedCount++;
-            log_stdout("Downloaded (", downloadedCount, "/", (downloadedCount + skippedCount), "): ", zoom, "/", x,
-                       "/", y);
-        } else {
-            if (fs::exists(tilePath)) {
-                fs::remove(tilePath);
-            }
-            log_stderr("Failed to download: ", zoom, "/", x, "/", y);
-        }
-    };
-
-    log_stdout("Caching metadata, thumbnails, and tiles in batches of ", batchSize, " image file(s)...");
-    for (size_t i = 0; i < allFiles.size(); i += batchSize) {
-        size_t end = std::min(i + batchSize, allFiles.size());
-        std::vector<fs::path> batch(allFiles.begin() + i, allFiles.begin() + end);
-
-        metadata_cache::SourceSnapshotByPath batchSourceSnapshots;
-        metadata_cache::MetadataByPath batchCachedMetadata;
-        std::vector<fs::path> batchMisses = batch;
-        std::string cacheReadError;
-
-        if (forceRefreshTarget == CacheRefreshTarget::Metadata) {
-            std::string cacheDeleteError;
-            if (!metadata_cache::deleteMetadataBatch(metadataCacheFile, batch, cacheDeleteError)) {
-                log_stderr("Metadata cache delete failed for batch ", (i + 1), "-", end, ": ", cacheDeleteError);
-                return 1;
-            }
-        }
-
-        bool batchCacheReadOk = metadata_cache::loadMetadataBatch(metadataCacheFile, batch, batchCachedMetadata,
-                                                                  batchMisses, cacheReadError, &batchSourceSnapshots);
-
-        if (!batchCacheReadOk && !cacheReadError.empty()) {
-            log_stderr("Metadata cache read failed for batch ", (i + 1), "-", end, ": ", cacheReadError);
-        }
-
-        totalCacheHits += batchCachedMetadata.size();
-        totalCacheMisses += batchMisses.size();
-
-        ImageMetadataCache batchMetadata;
-        batchMetadata.insert(batchCachedMetadata.begin(), batchCachedMetadata.end());
-
-        if (!batchMisses.empty()) {
-            log_stdout("Extracting metadata from cache-miss files ", (i + 1), "-", end, "...");
-            auto extractedMetadata = metadata::extractExiftoolData(batchMisses, g_exiftoolPath);
-            batchMetadata.insert(extractedMetadata.begin(), extractedMetadata.end());
-
-            if (!extractedMetadata.empty() &&
-                !metadata_cache::storeMetadataBatch(metadataCacheFile, extractedMetadata, metadataCacheError)) {
-                log_stderr("Metadata cache write failed for batch ", (i + 1), "-", end, ": ", metadataCacheError);
-                hadErrors = true;
-            } else if (!extractedMetadata.empty()) {
-                log_stdout("Stored metadata batch ", (i + 1), "-", end, " to cache");
-            }
-        }
-
-        for (const auto &imagePath : batch) {
-            fs::path thumbCacheFile = getThumbnailCacheFilePath(imagePath, cacheRoot);
-            std::error_code ec;
-            fs::create_directories(thumbCacheFile.parent_path(), ec);
-            if (ec) {
-                log_stderr("Failed to create thumbnail cache directory for ", imagePath.string(), ": ", ec.message());
-                continue;
-            }
-
-            if (forceRefreshTarget == CacheRefreshTarget::Thumbnail) {
-                std::error_code removeEc;
-                fs::remove(thumbCacheFile, removeEc);
-                fs::remove(getThumbnailCacheMetaFilePath(thumbCacheFile), removeEc);
-            }
-
-            if (useExistingThumb && forceRefreshTarget != CacheRefreshTarget::Thumbnail &&
-                fs::exists(thumbCacheFile)) {
-                // Explicit override: skip regeneration when cache file already exists.
-            } else {
-                std::error_code absEc;
-                fs::path absoluteImagePath = fs::absolute(imagePath, absEc);
-                if (!absEc) {
-                    absoluteImagePath = absoluteImagePath.lexically_normal();
-                }
-
-                if (!absEc && batchCachedMetadata.find(absoluteImagePath) != batchCachedMetadata.end()) {
-                    if (!fs::exists(thumbCacheFile) && !writeThumbnailCacheFile(imagePath, thumbCacheFile)) {
-                        log_stderr("Failed to pre-cache thumbnail for ", imagePath.string());
-                    }
-                } else {
-                    const auto snapshotIt =
-                        (!absEc) ? batchSourceSnapshots.find(absoluteImagePath) : batchSourceSnapshots.end();
-                    if (snapshotIt != batchSourceSnapshots.end()) {
-                        if (!thumbnailCacheMatchesSource(thumbCacheFile, snapshotIt->second.mtime,
-                                                         snapshotIt->second.size)) {
-                            if (!writeThumbnailCacheFile(imagePath, thumbCacheFile)) {
-                                log_stderr("Failed to pre-cache thumbnail for ", imagePath.string());
-                            }
-                        }
-                    } else if (!ensureThumbnailCacheFileOnDisk(imagePath, thumbCacheFile)) {
-                        log_stderr("Failed to pre-cache thumbnail for ", imagePath.string());
-                    }
-                }
-            }
-
-            auto metaIt = batchMetadata.find(imagePath);
-            if (metaIt == batchMetadata.end() || !hasValidGps(metaIt->second)) {
-                continue;
-            }
-
-            validGPSCount++;
-            const json &meta = metaIt->second;
-            double lat = meta["GPSLatitude"].get<double>();
-            double lon = meta["GPSLongitude"].get<double>();
-            auto tiles = calculateTilesForView(lat, lon, defaultZoom, expandedWidth, expandedHeight);
-
-            for (const auto &tile : tiles) {
-                processTile(tile.x, tile.y, tile.zoom);
-            }
-        }
-
-        log_stdout("Processed cache batch ", (i + 1), "-", end, " (hits: ", batchCachedMetadata.size(),
-                   ", misses: ", batchMisses.size(), ")");
-    }
-
-    log_stdout("Metadata cache hits: ", totalCacheHits, " / ", allFiles.size(), " (misses: ", totalCacheMisses, ")");
-    log_stdout("Thumbnail pre-cache complete");
-
-    log_stdout("Files with valid GPS: ", validGPSCount, "/", allFiles.size());
-
-    if (validGPSCount == 0) {
-        log_stderr("No files with GPS coordinates found");
-        return 1;
-    }
-
-    log_stdout("Total unique tiles needed: ", uniqueTiles.size());
-
-    log_stdout("Caching complete!");
-    log_stdout("Downloaded: ", downloadedCount, " tiles");
-    log_stdout("Already cached: ", skippedCount, " tiles");
-
-    return hadErrors ? 1 : 0;
-}
+// Cache mode logic is implemented in precache.cpp.
 
 int runSearchMode(const std::vector<std::string> &requiredTokensInput, const std::string &prefixInput,
                   const std::string &configPath) {
@@ -7716,6 +7216,7 @@ int main(int argc, char *argv[]) {
     std::string mode; // "", "self-check", "cache", "search", "exiftool", "poor"
     std::vector<std::string> cachePaths;
     bool cacheUseExistingThumb = false;
+    bool cacheIgnoreDirMtime = false;
     CacheRefreshTarget cacheForceRefreshTarget = CacheRefreshTarget::None;
     std::vector<std::string> searchArgs;
 
@@ -7747,6 +7248,10 @@ int main(int argc, char *argv[]) {
                     cacheUseExistingThumb = true;
                     continue;
                 }
+                if (cacheArg == "--ignore-dir-mtime") {
+                    cacheIgnoreDirMtime = true;
+                    continue;
+                }
                 if (cacheArg == "-f" || cacheArg == "--force-refresh") {
                     if (j + 1 >= argc) {
                         log_stderr("Error: ", cacheArg, " requires a cache type (metadata, thumb, map_tile)");
@@ -7760,6 +7265,10 @@ int main(int argc, char *argv[]) {
                     }
                     cacheForceRefreshTarget = *refreshTarget;
                     continue;
+                }
+                if (!cacheArg.empty() && cacheArg[0] == '-') {
+                    log_stderr("Error: Unknown option for --cache: ", cacheArg);
+                    return 1;
                 }
                 cachePaths.push_back(cacheArg);
             }
@@ -7823,7 +7332,8 @@ int main(int argc, char *argv[]) {
             log_stderr("Error: --cache requires at least one path");
             return 1;
         }
-        return runCacheMode(cachePaths, configFile, cacheUseExistingThumb, cacheForceRefreshTarget);
+        return runCacheMode(cachePaths, configFile, cacheUseExistingThumb, cacheForceRefreshTarget,
+                            cacheIgnoreDirMtime);
     }
 
     // Handle search mode
